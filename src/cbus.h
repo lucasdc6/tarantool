@@ -51,28 +51,6 @@ enum cbus_stat_name {
 
 extern const char *cbus_stat_strings[CBUS_STAT_LAST];
 
-/**
- * One hop in a message travel route.  A message may need to be
- * delivered to many destinations before it can be dispensed with.
- * For example, it may be necessary to return a message to the
- * sender just to destroy it.
- *
- * Message travel route is an array of cmsg_hop entries. The first
- * entry contains a delivery function at the first destination,
- * and the next destination. Subsequent entries are alike. The
- * last entry has a delivery function (most often a message
- * destructor) and NULL for the next destination.
- */
-struct cmsg_hop {
-	/** The message delivery function. */
-	cmsg_f f;
-	/**
-	 * The next destination to which the message
-	 * should be routed after its delivered locally.
-	 */
-	struct cpipe *pipe;
-};
-
 /** A message traveling between cords. */
 struct cmsg {
 	/**
@@ -81,24 +59,19 @@ struct cmsg {
 	 * delivered.
 	 */
 	struct stailq_entry fifo;
-	/** The message routing path. */
-	const struct cmsg_hop *route;
-	/** The current hop the message is at. */
-	const struct cmsg_hop *hop;
+	cmsg_f f;
 };
 
-static inline struct cmsg *cmsg(void *ptr) { return (struct cmsg *) ptr; }
-
-/** Initialize the message and set its route. */
+/**
+ * Deliver the message and dispatch it to the next hop.
+ */
 static inline void
-cmsg_init(struct cmsg *msg, const struct cmsg_hop *route)
+cmsg_deliver(struct cmsg *msg)
 {
-	/**
-	 * The first hop can be done explicitly with cbus_push(),
-	 * msg->hop thus points to the second hop.
-	 */
-	msg->hop = msg->route = route;
+	msg->f(msg);
 }
+
+static inline struct cmsg *cmsg(void *ptr) { return (struct cmsg *) ptr; }
 
 /** A  uni-directional FIFO queue from one cord to another. */
 struct cpipe {
@@ -181,15 +154,16 @@ cpipe_flush_input(struct cpipe *pipe)
 }
 
 /**
- * Push a single message to the pipe input. The message is pushed
+ * Push a single message with handler to the pipe input. The message is pushed
  * to a staging area. To be delivered, the input needs to be
  * flushed with cpipe_flush_input().
  */
 static inline void
-cpipe_push_input(struct cpipe *pipe, struct cmsg *msg)
+cpipe_push_input(struct cpipe *pipe, struct cmsg *msg, cmsg_f f)
 {
 	assert(loop() == pipe->producer);
 
+	msg->f = f;
 	stailq_add_tail_entry(&pipe->input, msg, fifo);
 	pipe->n_input++;
 	if (pipe->n_input >= pipe->max_input)
@@ -197,15 +171,16 @@ cpipe_push_input(struct cpipe *pipe, struct cmsg *msg)
 }
 
 /**
- * Push a single message and ensure it's delivered.
+ * Push a single message with handler and ensure it's delivered.
  * A combo of push_input + flush_input for cases when
  * it's not known at all whether there'll be other
  * messages coming up.
  */
 static inline void
-cpipe_push(struct cpipe *pipe, struct cmsg *msg)
+cpipe_push(struct cpipe *pipe, struct cmsg *msg, cmsg_f f)
 {
-	cpipe_push_input(pipe, msg);
+	msg->f = f;
+	cpipe_push_input(pipe, msg, f);
 	assert(pipe->n_input < pipe->max_input);
 	if (pipe->n_input == 1)
 		ev_feed_event(pipe->producer, &pipe->flush_input, EV_CUSTOM);
@@ -255,19 +230,6 @@ struct cpipe *
 cbus_route(const char *name);
 
 /**
- * A helper message to wakeup caller whenever an event
- * occurs.
- */
-struct cmsg_notify
-{
-	struct cmsg base;
-	struct fiber *fiber;
-};
-
-void
-cmsg_notify_init(struct cmsg_notify *msg);
-
-/**
  * A helper method to invoke a function on the other side of the
  * bus.
  *
@@ -301,7 +263,6 @@ struct cbus_call_msg
 	struct cmsg msg;
 	struct diag diag;
 	struct fiber *caller;
-	struct cmsg_hop route[2];
 	bool complete;
 	int rc;
 	/** The callback to invoke in the peer thread. */
@@ -311,6 +272,10 @@ struct cbus_call_msg
 	 * times out or the caller is canceled.
 	 */
 	cbus_call_f free_cb;
+	/**
+	 * A pipe for message callback
+	 */
+	struct cpipe *caller_pipe;
 };
 
 int

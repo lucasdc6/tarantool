@@ -215,79 +215,6 @@ cpipe_flush_cb(ev_loop *loop, struct ev_async *watcher, int events)
 	}
 }
 
-/* {{{ cmsg */
-
-/**
- * Dispatch the message to the next hop.
- */
-static inline void
-cmsg_dispatch(struct cpipe *pipe, struct cmsg *msg)
-{
-	/**
-	 * 'pipe' pointer saved in class constructor works as
-	 * a guard that the message is alive. If a message route
-	 * has the next pipe, then the message mustn't have been
-	 * destroyed on this hop. Otherwise msg->hop->pipe could
-	 * be already pointing to garbage.
-	 */
-	if (pipe) {
-		/*
-		 * Once we pushed the message to the bus,
-		 * we relinquished all write access to it,
-		 * so we must increase the current hop *before*
-		 * push.
-		 */
-		msg->hop++;
-		cpipe_push(pipe, msg);
-	}
-}
-
-/**
- * Deliver the message and dispatch it to the next hop.
- */
-static inline void
-cmsg_deliver(struct cmsg *msg)
-{
-	/*
-	 * Save the pointer to the last pipe,
-	 * the memory where it is stored may be destroyed
-	 * on the last hop.
-	 */
-	struct cpipe *pipe = msg->hop->pipe;
-	msg->hop->f(msg);
-	cmsg_dispatch(pipe, msg);
-}
-
-static void
-cmsg_notify_deliver(struct cmsg *msg)
-{
-	fiber_wakeup(((struct cmsg_notify *) msg)->fiber);
-}
-
-void
-cmsg_notify_init(struct cmsg_notify *msg)
-{
-	static struct cmsg_hop route[] = { { cmsg_notify_deliver, NULL }, };
-
-	cmsg_init(&msg->base, route);
-	msg->fiber = fiber();
-}
-
-/* }}} cmsg */
-
-/**
- * Call the target function and store the results (diag, rc) in
- * struct cbus_call_msg.
- */
-void
-cbus_call_perform(struct cmsg *m)
-{
-	struct cbus_call_msg *msg = (struct cbus_call_msg *)m;
-	msg->rc = msg->func(msg);
-	if (msg->rc)
-		diag_move(&fiber()->diag, &msg->diag);
-}
-
 /**
  * Wake up the caller fiber to reap call results.
  * If the fiber is gone, e.g. in case of call timeout
@@ -307,6 +234,20 @@ cbus_call_done(struct cmsg *m)
 }
 
 /**
+ * Call the target function and store the results (diag, rc) in
+ * struct cbus_call_msg.
+ */
+void
+cbus_call_perform(struct cmsg *m)
+{
+	struct cbus_call_msg *msg = (struct cbus_call_msg *)m;
+	msg->rc = msg->func(msg);
+	if (msg->rc)
+		diag_move(&fiber()->diag, &msg->diag);
+	cpipe_push(msg->caller_pipe, m, cbus_call_done);
+}
+
+/**
  * Execute a synchronous call over cbus.
  */
 int
@@ -318,17 +259,13 @@ cbus_call(struct cpipe *callee, struct cpipe *caller, struct cbus_call_msg *msg,
 	diag_create(&msg->diag);
 	msg->caller = fiber();
 	msg->complete = false;
-	msg->route[0].f = cbus_call_perform;
-	msg->route[0].pipe = caller;
-	msg->route[1].f = cbus_call_done;
-	msg->route[1].pipe = NULL;
-	cmsg_init(cmsg(msg), msg->route);
+	msg->caller_pipe = caller;
 
 	msg->func = func;
 	msg->free_cb = free_cb;
 	msg->rc = 0;
 
-	cpipe_push(callee, cmsg(msg));
+	cpipe_push(callee, cmsg(msg), cbus_call_perform);
 
 	fiber_yield_timeout(timeout);
 	if (msg->complete == false) {           /* timed out or cancelled */

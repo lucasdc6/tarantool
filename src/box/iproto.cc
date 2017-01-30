@@ -308,6 +308,19 @@ static void
 net_end_join_subscribe(struct cmsg *msg);
 
 /**
+ * Cleanup the net thread resources of a connection
+ * and close the connection.
+ */
+static void
+net_finish_disconnect(struct cmsg *m)
+{
+	struct iproto_msg *msg = (struct iproto_msg *) m;
+	/* Runs the trigger, which may yield. */
+	iproto_connection_delete(msg->connection);
+	iproto_msg_delete(msg);
+}
+
+/**
  * Fire on_disconnect triggers in the tx
  * thread and destroy the session object,
  * as well as output buffers of the connection.
@@ -329,58 +342,21 @@ tx_process_disconnect(struct cmsg *m)
 	 */
 	obuf_destroy(&con->iobuf[0]->out);
 	obuf_destroy(&con->iobuf[1]->out);
+	cpipe_push(&net_pipe, m, net_finish_disconnect);
 }
 
-/**
- * Cleanup the net thread resources of a connection
- * and close the connection.
- */
-static void
-net_finish_disconnect(struct cmsg *m)
-{
-	struct iproto_msg *msg = (struct iproto_msg *) m;
-	/* Runs the trigger, which may yield. */
-	iproto_connection_delete(msg->connection);
-	iproto_msg_delete(msg);
-}
-
-static const struct cmsg_hop disconnect_route[] = {
-	{ tx_process_disconnect, &net_pipe },
-	{ net_finish_disconnect, NULL },
-};
-
-static const struct cmsg_hop misc_route[] = {
-	{ tx_process_misc, &net_pipe },
-	{ net_send_msg, NULL },
-};
-
-static const struct cmsg_hop select_route[] = {
-	{ tx_process_select, &net_pipe },
-	{ net_send_msg, NULL },
-};
-
-static const struct cmsg_hop process1_route[] = {
-	{ tx_process1, &net_pipe },
-	{ net_send_msg, NULL },
-};
-
-static const struct cmsg_hop *dml_route[IPROTO_TYPE_STAT_MAX] = {
+static const cmsg_f dml_handlers[IPROTO_TYPE_STAT_MAX] = {
 	NULL,                                   /* IPROTO_OK */
-	select_route,                           /* IPROTO_SELECT */
-	process1_route,                         /* IPROTO_INSERT */
-	process1_route,                         /* IPROTO_REPLACE */
-	process1_route,                         /* IPROTO_UPDATE */
-	process1_route,                         /* IPROTO_DELETE */
-	misc_route,                             /* IPROTO_CALL_16 */
-	misc_route,                             /* IPROTO_AUTH */
-	misc_route,                             /* IPROTO_EVAL */
-	process1_route,                         /* IPROTO_UPSERT */
-	misc_route                              /* IPROTO_CALL */
-};
-
-static const struct cmsg_hop sync_route[] = {
-	{ tx_process_join_subscribe, &net_pipe },
-	{ net_end_join_subscribe, NULL },
+	tx_process_select,                      /* IPROTO_SELECT */
+	tx_process1,                            /* IPROTO_INSERT */
+	tx_process1,                            /* IPROTO_REPLACE */
+	tx_process1,                            /* IPROTO_UPDATE */
+	tx_process1,                            /* IPROTO_DELETE */
+	tx_process_misc,                        /* IPROTO_CALL_16 */
+	tx_process_misc,                        /* IPROTO_AUTH */
+	tx_process_misc,                        /* IPROTO_EVAL */
+	tx_process1,                            /* IPROTO_UPSERT */
+	tx_process_misc                         /* IPROTO_CALL */
 };
 
 static struct iproto_connection *
@@ -400,7 +376,6 @@ iproto_connection_new(const char *name, int fd)
 	rlist_create(&con->in_stop_list);
 	/* It may be very awkward to allocate at close. */
 	con->disconnect = iproto_msg_new(con);
-	cmsg_init(con->disconnect, disconnect_route);
 	return con;
 }
 
@@ -445,7 +420,7 @@ iproto_connection_close(struct iproto_connection *con)
 		assert(con->disconnect != NULL);
 		struct iproto_msg *msg = con->disconnect;
 		con->disconnect = NULL;
-		cpipe_push(&tx_pipe, msg);
+		cpipe_push(&tx_pipe, msg, tx_process_disconnect);
 	}
 	rlist_del(&con->in_stop_list);
 }
@@ -543,7 +518,7 @@ iproto_connection_input_iobuf(struct iproto_connection *con)
 	return newbuf;
 }
 
-static void
+static cmsg_f
 iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 		  bool *stop_input)
 {
@@ -577,21 +552,18 @@ iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 		request_decode_xc(&msg->request,
 				 (const char *) msg->header.body[0].iov_base,
 				 msg->header.body[0].iov_len);
-		assert(msg->header.type < sizeof(dml_route)/sizeof(*dml_route));
-		cmsg_init(msg, dml_route[msg->header.type]);
-		break;
+		assert(msg->header.type < sizeof(dml_handlers)/sizeof(*dml_handlers));
+		return dml_handlers[msg->header.type];
 	case IPROTO_PING:
-		cmsg_init(msg, misc_route);
-		break;
+		return tx_process_misc;
 	case IPROTO_JOIN:
 	case IPROTO_SUBSCRIBE:
-		cmsg_init(msg, sync_route);
 		*stop_input = true;
-		break;
+		return tx_process_join_subscribe;
 	default:
 		tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
 			  (uint32_t) msg->header.type);
-		break;
+		return NULL;
 	}
 }
 
@@ -622,8 +594,9 @@ iproto_enqueue_batch(struct iproto_connection *con, struct ibuf *in)
 		msg->len = reqend - reqstart; /* total request length */
 
 		try {
-			iproto_decode_msg(msg, &pos, reqend, &stop_input);
-			cpipe_push_input(&tx_pipe, guard.release());
+			cpipe_push_input(&tx_pipe, guard.release(),
+					 iproto_decode_msg(msg, &pos, reqend,
+							   &stop_input));
 			n_requests++;
 		} catch (Exception *e) {
 			/*
@@ -881,11 +854,13 @@ tx_process1(struct cmsg *m)
 	iproto_reply_select(out, &svp, msg->header.sync,
 			    tuple != 0);
 	msg->write_end = obuf_create_svp(out);
+	cpipe_push(&net_pipe, m, net_send_msg);
 	return;
 error:
 	iproto_reply_error(out, diag_last_error(&fiber()->diag),
 			   msg->header.sync);
 	msg->write_end = obuf_create_svp(out);
+	cpipe_push(&net_pipe, m, net_send_msg);
 }
 
 static void
@@ -915,11 +890,13 @@ tx_process_select(struct cmsg *m)
 	port_dump(&port, out);
 	iproto_reply_select(out, &svp, msg->header.sync, port.size);
 	msg->write_end = obuf_create_svp(out);
+	cpipe_push(&net_pipe, m, net_send_msg);
 	return;
 error:
 	iproto_reply_error(out, diag_last_error(&fiber()->diag),
 			   msg->header.sync);
 	msg->write_end = obuf_create_svp(out);
+	cpipe_push(&net_pipe, m, net_send_msg);
 }
 
 static void
@@ -959,11 +936,13 @@ tx_process_misc(struct cmsg *m)
 				   msg->header.sync);
 	}
 	msg->write_end = obuf_create_svp(out);
+	cpipe_push(&net_pipe, m, net_send_msg);
 	return;
 error:
 	iproto_reply_error(out, diag_last_error(&fiber()->diag),
 			   msg->header.sync);
 	msg->write_end = obuf_create_svp(out);
+	cpipe_push(&net_pipe, m, net_send_msg);
 }
 
 static void
@@ -1001,6 +980,7 @@ tx_process_join_subscribe(struct cmsg *m)
 	} catch (Exception *e) {
 		iproto_write_error(con->input.fd, e);
 	}
+	cpipe_push(&net_pipe, m, net_end_join_subscribe);
 }
 
 static void
@@ -1040,6 +1020,9 @@ net_end_join_subscribe(struct cmsg *m)
 	iproto_enqueue_batch(con, &iobuf->in);
 }
 
+static void
+net_send_greeting(struct cmsg *m);
+
 /**
  * Handshake a connection: invoke the on-connect trigger
  * and possibly authenticate. Try to send the client an error
@@ -1066,6 +1049,7 @@ tx_process_connect(struct cmsg *m)
 		iproto_reply_error(out, e, 0 /* zero sync for connect error */);
 		msg->close_connection = true;
 	}
+	cpipe_push(&net_pipe, m, net_send_greeting);
 }
 
 /**
@@ -1105,11 +1089,6 @@ net_send_greeting(struct cmsg *m)
 	iproto_msg_delete(msg);
 }
 
-static const struct cmsg_hop connect_route[] = {
-	{ tx_process_connect, &net_pipe },
-	{ net_send_greeting, NULL },
-};
-
 /** }}} */
 
 /**
@@ -1132,10 +1111,9 @@ iproto_on_accept(struct evio_service * /* service */, int fd,
 	 * use, all stored in just a few blocks of the memory pool.
 	 */
 	struct iproto_msg *msg = iproto_msg_new(con);
-	cmsg_init(msg, connect_route);
 	msg->iobuf = con->iobuf[0];
 	msg->close_connection = false;
-	cpipe_push(&tx_pipe, msg);
+	cpipe_push(&tx_pipe, msg, tx_process_connect);
 }
 
 static struct evio_service binary; /* iproto binary listener */
