@@ -146,6 +146,13 @@ void
 cpipe_create(struct cpipe *pipe, const char *consumer);
 
 /**
+ * Deinitialize a pipe and disconnect it from the consumer.
+ * Must be called by producer. Will flash queued messages.
+ */
+void
+cpipe_destroy(struct cpipe *pipe);
+
+/**
  * Set pipe max size of staged push area. The default is infinity.
  * If staged push cap is set, the pushed messages are flushed
  * whenever the area has more messages than the cap, and also once
@@ -246,6 +253,8 @@ struct cbus_endpoint {
 	ev_loop *consumer;
 	/** Async to notify the consumer */
 	ev_async async;
+	/** Count of connected pipes */
+	uint32_t n_pipes;
 };
 
 /**
@@ -268,12 +277,13 @@ void
 cbus_free();
 
 /**
- * Connect the cord to cbus as a named reciever and create
- * fiber pool to process incoming messages.
+ * Connect the cord to cbus as a named reciever.
  * @param name a destination name
  * @param fetch_cb callback to fetch new messages
+ * @retval 0 for success
+ * @retval 1 if endpoint with given name already registered
  */
-void
+int
 cbus_join(struct cbus_endpoint *endpoint, const char *name,
 	  void (*fetch_cb)(ev_loop *, struct ev_watcher *, int), void *fetch_data);
 
@@ -295,6 +305,14 @@ cbus_loop(struct cbus_endpoint *endpoint);
  */
 void
 cbus_stop_loop(struct cpipe *pipe);
+
+/**
+ * Disconnect the cord from cbus.
+ * @retval 0 for success
+ * @retval 1 if there is connected pipe or unhandled message
+ */
+int
+cbus_leave(struct cbus_endpoint *endpoint);
 
 /**
  * A helper method to invoke a function on the other side of the
