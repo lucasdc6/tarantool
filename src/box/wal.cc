@@ -596,6 +596,8 @@ wal_writer_f(va_list ap)
 
 	cbus_loop(&endpoint);
 
+	cpipe_destroy(&wal_writer_singleton.tx_pipe);
+
 	if (writer->is_active) {
 		xlog_close(&writer->current_wal, false);
 		writer->is_active = false;
