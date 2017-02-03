@@ -43,6 +43,50 @@
 
 static const char *sessionlib_name = "box.session";
 
+uint32_t CTID_CONST_STRUCT_SESSION_REF;
+
+struct session *
+lua_checksession(struct lua_State *L, int narg)
+{
+	assert(CTID_CONST_STRUCT_SESSION_REF != 0);
+	uint32_t ctypeid;
+	void *data;
+
+	if (lua_type(L, narg) != LUA_TCDATA)
+		return NULL;
+
+	data = luaL_checkcdata(L, narg, &ctypeid);
+	if (ctypeid != CTID_CONST_STRUCT_SESSION_REF)
+		return NULL;
+
+	if (data == NULL)  {
+		luaL_error(L, "Invalid argument #%d (session expected, got %s)",
+		           narg, lua_typename(L, lua_type(L, narg)));
+	}
+
+	return *(struct session **)data;
+}
+
+static inline int
+lbox_session_gc(struct lua_State *L)
+{
+	struct session *s = lua_checksession(L, 1);
+	session_destroy(s);
+	return 0;
+}
+
+void
+lua_pushsession(struct lua_State *L, struct session *s)
+{
+	assert(CTID_CONST_STRUCT_SESSION_REF != 0);
+	struct session **ptr = (struct session **)
+		luaL_pushcdata(L, CTID_CONST_STRUCT_SESSION_REF);
+	*ptr = s;
+	lua_pushcfunction(L, lbox_session_gc);
+	luaL_setcdatagc(L, -2);
+}
+
+
 /**
  * Return a unique monotonic session
  * identifier. The identifier can be used
@@ -291,4 +335,10 @@ box_lua_session_init(struct lua_State *L)
 	};
 	luaL_register_module(L, sessionlib_name, sessionlib);
 	lua_pop(L, 1);
+
+	/* Get CTypeID for `struct session' */
+	int rc = luaL_cdef(L, "struct session;");
+	assert(rc == 0); (void) rc;
+	CTID_CONST_STRUCT_SESSION_REF = luaL_ctypeid(L, "const struct session &");
+	assert(CTID_CONST_STRUCT_SESSION_REF != 0);
 }

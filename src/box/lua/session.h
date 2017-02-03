@@ -35,6 +35,17 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
+/* Functions for manipulating session object on Lua stack */
+
+struct session;
+struct lua_State;
+
+struct session *
+lua_checksession(struct lua_State *L, int narg);
+
+void
+lua_pushsession(struct lua_State *L, struct session *s);
+
 struct lua_State;
 void
 box_lua_session_init(struct lua_State *L);

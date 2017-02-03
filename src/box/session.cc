@@ -28,7 +28,7 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "session.h"
+#include "box/session.h"
 #include "fiber.h"
 #include "memory.h"
 

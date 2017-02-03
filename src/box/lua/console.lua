@@ -1,12 +1,27 @@
 -- console.lua -- internal file
 
 local internal = require('console')
+
+local ffi = require('ffi')
+local log = require('log')
+local yaml = require('yaml')
+local errno = require('errno')
 local fiber = require('fiber')
 local socket = require('socket')
-local log = require('log')
-local errno = require('errno')
 local urilib = require('uri')
-local yaml = require('yaml')
+
+ffi.cdef[[
+    struct session;
+]]
+
+local session_t = ffi.typeof('struct session')
+ffi.metatype(session_t, {
+    __index = {
+        set_fd        = internal.session_set_fd,
+        on_connect    = internal.session_exec_on_connect,
+        on_disconnect = internal.session_exec_on_disconnect,
+    }
+})
 
 -- admin formatter must be able to encode any Lua variable
 local formatter = yaml.new()
@@ -340,20 +355,25 @@ local function connect(uri, opts)
     return true
 end
 
+local version = _TARANTOOL:match("([^-]+)-")
+local lua_console_greeting = string.format(
+    "%-63s\n%-63s\n",
+    "Tarantool " .. version.. " (Lua console)",
+    "type 'help' for interactive help"
+)
+
 local function client_handler(client, peer)
-    log.info("client %s:%s connected", peer.host, peer.port)
+    local session = internal.session_create(client:fd())
+    session.on_connect(session)
     local state = setmetatable({
         running = true;
         read = client_read;
         print = client_print;
         client = client;
     }, repl_mt)
-    local version = _TARANTOOL:match("([^-]+)-")
-    state:print(string.format("%-63s\n%-63s\n",
-        "Tarantool ".. version.." (Lua console)",
-        "type 'help' for interactive help"))
+    state:print(lua_console_greeting)
     repl(state)
-    log.info("client %s:%s disconnected", peer.host, peer.port)
+    session:on_disconnect()
 end
 
 --
@@ -372,8 +392,11 @@ local function listen(uri)
         host = u.host
         port = u.service or 3313
     end
-    local s, addr = socket.tcp_server(host, port, { handler = client_handler,
-        name = 'console'})
+    local s, addr = socket.tcp_server(host, port, {
+        handler = client_handler,
+        name = 'console'
+    })
+
     if not s then
         error(string.format('failed to create server %s:%s: %s',
             host, port, errno.strerror()))

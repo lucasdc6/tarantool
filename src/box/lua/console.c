@@ -42,6 +42,7 @@
 #include <readline/history.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include "box/lua/session.h"
 
 /*
  * Completion engine (Mike Paul's).
@@ -323,14 +324,54 @@ lbox_console_add_history(struct lua_State *L)
 	return 0;
 }
 
+/* Create session and pin it to fiber */
+static int
+lbox_console_session_create(struct lua_State *L)
+{
+	int fd = luaL_checkinteger(L, 1);
+	struct session *s = session_create(fd);
+	credentials_init(&s->credentials, ADMIN, ADMIN);
+	if (s == NULL)
+		return luaT_error(L);
+	fiber_set_session(fiber(), s);
+	fiber_set_user(fiber(), &s->credentials);
+	say_info("creating session: %p", (void *)s);
+	lua_pushsession(L, s);
+	return 1;
+}
+
+static int
+lbox_console_session_exec_on_connect(struct lua_State *L)
+{
+	struct session *s = lua_checksession(L, 1);
+	say_info("exec on connect session: %p", (void *)s);
+	if (!rlist_empty(&session_on_connect))
+		if (session_run_on_connect_triggers(s) == -1)
+			luaT_error(L);
+	return 0;
+}
+
+static int
+lbox_console_session_exec_on_disconnect(struct lua_State *L)
+{
+	struct session *s = lua_checksession(L, -1);
+	say_info("exec on disconnect session: %p", (void *)s);
+	if (!rlist_empty(&session_on_disconnect))
+		session_run_on_disconnect_triggers(s);
+	return 0;
+}
+
 void
 tarantool_lua_console_init(struct lua_State *L)
 {
 	static const struct luaL_reg consolelib[] = {
-		{"load_history",       lbox_console_load_history},
-		{"save_history",       lbox_console_save_history},
-		{"add_history",        lbox_console_add_history},
-		{"completion_handler", lbox_console_completion_handler},
+		{"session_create",             lbox_console_session_create},
+		{"session_exec_on_connect",    lbox_console_session_exec_on_connect},
+		{"session_exec_on_disconnect", lbox_console_session_exec_on_disconnect},
+		{"load_history",               lbox_console_load_history},
+		{"save_history",               lbox_console_save_history},
+		{"add_history",                lbox_console_add_history},
+		{"completion_handler",         lbox_console_completion_handler},
 		{NULL, NULL}
 	};
 	luaL_register_module(L, "console", consolelib);
