@@ -48,27 +48,17 @@ VinylSpace::applyInitialJoinRow(struct space *space, struct request *request)
 {
 	assert(request->type == IPROTO_INSERT);
 	assert(request->header != NULL);
-	struct vy_env *env = ((VinylEngine *)space->handler->engine)->env;
 
 	/* Check the tuple fields. */
 	if (tuple_validate_raw(space->format, request->tuple))
 		diag_raise();
-
-	struct vy_tx *tx = vy_begin(env);
-	if (tx == NULL)
-		diag_raise();
-
-	int64_t signature = request->header->lsn;
-
-	if (vy_replace(tx, NULL, space, request))
-		diag_raise();
-
-	if (vy_prepare(env, tx)) {
-		vy_rollback(env, tx);
-		diag_raise();
-	}
-	if (vy_commit(env, tx, signature))
+	struct txn *txn = txn_begin_stmt(space);
+	try {
+		this->executeReplace(txn, space, request);
+		txn_commit_stmt(txn, request);
+	} catch (Exception *e) {
 		panic("failed to commit vinyl transaction");
+	}
 }
 
 /*
