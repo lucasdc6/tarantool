@@ -5856,39 +5856,31 @@ static inline int
 vy_replace_one(struct vy_tx *tx, struct space *space,
 	       struct request *request, struct txn_stmt *stmt)
 {
+	assert(stmt != NULL);
 	assert(tx != NULL && tx->state == VINYL_TX_READY);
 	assert(space->index_count == 1);
 	struct vy_index *pk = vy_index(space->index[0]);
 	struct key_def *def = pk->key_def;
 	assert(def->iid == 0);
-	struct tuple *new_tuple =
-		vy_stmt_new_replace(space->format, request->tuple,
-				    request->tuple_end);
-	if (new_tuple == NULL)
+	stmt->new_tuple = vy_stmt_new_replace(space->format, request->tuple,
+					      request->tuple_end);
+	if (stmt->new_tuple == NULL)
 		return -1;
 	/**
 	 * If the space has triggers, then we need to fetch the
 	 * old tuple to pass it to the trigger. Use vy_get to
 	 * fetch it.
 	 */
-	if (stmt != NULL && !rlist_empty(&space->on_replace)) {
+	if (! rlist_empty(&space->on_replace)) {
 		const char *key;
-		key = tuple_extract_key(new_tuple, def, NULL);
+		key = tuple_extract_key(stmt->new_tuple, def, NULL);
 		if (key == NULL)                /* out of memory */
 			return -1;
 		uint32_t part_count = mp_decode_array(&key);
 		if (vy_get(tx, pk, key, part_count, &stmt->old_tuple))
 			return -1;
 	}
-	if (vy_tx_set(tx, pk, new_tuple)) {
-		tuple_unref(new_tuple);
-		return -1;
-	}
-	if (stmt != NULL)
-		stmt->new_tuple = new_tuple;
-	else
-		tuple_unref(new_tuple);
-	return 0;
+	return vy_tx_set(tx, pk, stmt->new_tuple);
 }
 
 /**
@@ -5910,38 +5902,38 @@ static inline int
 vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 		struct txn_stmt *stmt)
 {
+	assert(stmt != NULL);
 	assert(tx != NULL && tx->state == VINYL_TX_READY);
-	struct tuple *old_stmt = NULL;
-	struct tuple *new_stmt = NULL;
-	struct tuple *delete = NULL;
 	struct vy_index *pk = vy_index_find(space, 0);
 	if (pk == NULL) /* space has no primary key */
 		return -1;
 	struct key_def *def = pk->key_def;
 	assert(def->iid == 0);
-	new_stmt = vy_stmt_new_replace(space->format, request->tuple,
-				       request->tuple_end);
-	if (new_stmt == NULL)
+	stmt->new_tuple = vy_stmt_new_replace(space->format, request->tuple,
+					      request->tuple_end);
+	if (stmt->new_tuple == NULL)
 		return -1;
-	const char *key = tuple_extract_key(new_stmt, def, NULL);
+	const char *key = tuple_extract_key(stmt->new_tuple, def, NULL);
 	if (key == NULL) /* out of memory */
-		goto error;
+		return -1;
 	uint32_t part_count = mp_decode_array(&key);
 
 	/* Get full tuple from the primary index. */
-	if (vy_index_get(tx, pk, key, part_count, &old_stmt) != 0)
+	if (vy_index_get(tx, pk, key, part_count, &stmt->old_tuple) != 0)
 		return -1;
 	/*
 	 * Replace in the primary index without explicit deletion
 	 * of the old tuple.
 	 */
-	if (vy_tx_set(tx, pk, new_stmt) != 0)
-		goto error;
+	if (vy_tx_set(tx, pk, stmt->new_tuple) != 0)
+		return -1;
 
-	if (space->index_count > 1 && old_stmt != NULL) {
-		delete = vy_stmt_new_surrogate_delete(space->format, old_stmt);
+	struct tuple *delete = NULL;
+	if (space->index_count > 1 && stmt->old_tuple != NULL) {
+		delete = vy_stmt_new_surrogate_delete(space->format,
+						      stmt->old_tuple);
 		if (delete == NULL)
-			goto error;
+			return -1;
 	}
 
 	/* Update secondary keys, avoid duplicates. */
@@ -5953,31 +5945,17 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 		 * fully match, there is no look up beyond the
 		 * transaction index.
 		 */
-		if (old_stmt != NULL) {
-			if (vy_tx_set(tx, index, delete) != 0)
+		if (stmt->old_tuple != NULL &&
+		    vy_tx_set(tx, index, delete) != 0)
 				goto error;
-		}
-		if (vy_insert_secondary(tx, index, new_stmt) != 0)
+		if (vy_insert_secondary(tx, index, stmt->new_tuple) != 0)
 			goto error;
 	}
 	if (delete != NULL)
 		tuple_unref(delete);
-	/*
-	 * The old tuple is used if there is an on_replace
-	 * trigger.
-	 */
-	if (stmt != NULL) {
-		stmt->new_tuple = new_stmt;
-		stmt->old_tuple = old_stmt;
-	}
 	return 0;
 error:
-	if (delete != NULL)
-		tuple_unref(delete);
-	if (old_stmt != NULL)
-		tuple_unref(old_stmt);
-	if (new_stmt != NULL)
-		tuple_unref(new_stmt);
+	tuple_unref(delete);
 	return -1;
 }
 
@@ -6124,6 +6102,7 @@ int
 vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	  struct request *request)
 {
+	assert(stmt != NULL);
 	struct vy_index *pk = vy_index_find(space, 0);
 	if (pk == NULL)
 		return -1;
@@ -6243,6 +6222,7 @@ int
 vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	  struct request *request)
 {
+	assert(stmt != NULL);
 	assert(tx != NULL && tx->state == VINYL_TX_READY);
 	struct vy_index *index = vy_index_find_unique(space, request->index_id);
 	if (index == NULL)
@@ -6402,6 +6382,7 @@ int
 vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	  struct request *request)
 {
+	assert(stmt != NULL);
 	assert(tx != NULL && tx->state == VINYL_TX_READY);
 	/* Check update operations. */
 	if (tuple_update_check_ops(region_aligned_alloc_cb, &fiber()->gc,
@@ -6581,6 +6562,7 @@ int
 vy_replace(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	   struct request *request)
 {
+	assert(stmt != NULL);
 	struct vy_env *env = tx->manager->env;
 	/* Check the tuple fields. */
 	if (tuple_validate_raw(space->format, request->tuple))
