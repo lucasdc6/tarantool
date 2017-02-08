@@ -33,6 +33,9 @@
 
 #include <stdbool.h>
 #include "salad/stailq.h"
+#include "space.h"
+#include "trigger.h"
+#include "fiber.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -40,10 +43,12 @@ extern "C" {
 
 /** box statistics */
 extern struct rmean *rmean_box;
+extern double too_long_threshold;
 
 struct space;
 struct tuple;
 struct xrow_header;
+struct Engine;
 
 /**
  * A single statement of a multi-statement
@@ -64,17 +69,6 @@ struct txn_stmt {
 	struct xrow_header *row;
 };
 
-
-#if defined(__cplusplus)
-} /* extern "C" */
-
-#include "space.h"
-#include "trigger.h"
-#include "fiber.h"
-
-extern double too_long_threshold;
-struct tuple;
-
 struct txn {
 	/** List of statements in a transaction. */
 	struct stailq stmts;
@@ -90,7 +84,7 @@ struct txn {
 	/** The number of active nested statement-level transactions. */
 	int in_sub_stmt;
 	/** Engine involved in multi-statement transaction. */
-	Engine *engine;
+	struct Engine *engine;
 	/** Engine-specific transaction data */
 	void *engine_tx;
 	/**
@@ -101,6 +95,9 @@ struct txn {
 	 /** Commit and rollback triggers */
 	struct rlist on_commit, on_rollback;
 };
+
+#if defined(__cplusplus)
+} /* extern "C" */
 
 /* Pointer to the current transaction (if any) */
 static inline struct txn *
