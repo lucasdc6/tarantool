@@ -40,7 +40,6 @@ extern "C" {
 #endif
 
 struct vy_env;
-struct vy_tx;
 struct txn;
 struct vy_cursor;
 struct vy_index;
@@ -204,19 +203,19 @@ int
 vy_upsert(struct txn *txn, struct space *space, struct request *request);
 
 int
-vy_prepare(struct vy_env *e, struct vy_tx *tx);
+vy_prepare(struct vy_env *e, struct txn *txn);
 
 int
-vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn);
+vy_commit(struct vy_env *e, struct txn *txn, int64_t lsn);
 
 void
-vy_rollback(struct vy_env *e, struct vy_tx *tx);
-
-void *
-vy_savepoint(struct vy_tx *tx);
+vy_rollback(struct vy_env *e, struct txn *txn);
 
 void
-vy_rollback_to_savepoint(struct vy_tx *tx, void *svp);
+vy_savepoint(struct txn *txn);
+
+void
+vy_rollback_statement(struct txn *txn, struct txn_stmt *stmt);
 
 /*
  * Index
@@ -275,13 +274,13 @@ vy_index_bsize(struct vy_index *db);
  */
 
 /**
- * Create a cursor. If tx is not NULL, the cursor life time is
- * bound by the transaction life time. Otherwise, the cursor
- * allocates its own transaction.
+ * Create a cursor. If there is a transaction, the cursor life
+ * time is bound by the transaction life time. Otherwise, the
+ * cursor begins its own transaction.
  */
 struct vy_cursor *
-vy_cursor_new(struct vy_tx *tx, struct vy_index *index, const char *key,
-	      uint32_t part_count, enum iterator_type type);
+vy_cursor_new(struct vy_index *index, const char *key, uint32_t part_count,
+	      enum iterator_type type);
 
 void
 vy_cursor_delete(struct vy_cursor *cursor);

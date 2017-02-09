@@ -6585,16 +6585,21 @@ vy_replace(struct txn *txn, struct space *space, struct request *request)
 }
 
 void
-vy_rollback(struct vy_env *e, struct vy_tx *tx)
+vy_rollback(struct vy_env *e, struct txn *txn)
 {
+	if (txn->engine_tx == NULL)
+		return;
+	struct vy_tx *tx = (struct vy_tx *) txn->engine_tx;
 	vy_tx_rollback(e, tx);
 	TRASH(tx);
 	free(tx);
+	txn->engine_tx = NULL;
 }
 
 int
-vy_prepare(struct vy_env *e, struct vy_tx *tx)
+vy_prepare(struct vy_env *e, struct txn *txn)
 {
+	struct vy_tx *tx = txn->engine_tx;
 	/* prepare transaction */
 	assert(tx->state == VINYL_TX_READY);
 	int rc = 0;
@@ -6626,8 +6631,11 @@ vy_prepare(struct vy_env *e, struct vy_tx *tx)
 }
 
 int
-vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
+vy_commit(struct vy_env *e, struct txn *txn, int64_t lsn)
 {
+	struct vy_tx *tx = txn->engine_tx;
+	if (tx == NULL)
+		return 0;
 	assert(tx->state == VINYL_TX_COMMIT);
 	if (lsn > e->xm->lsn)
 		e->xm->lsn = lsn;
@@ -6663,6 +6671,7 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 	free(tx);
 
 	vy_quota_use(quota, write_size);
+	txn->engine_tx = NULL;
 	return 0;
 }
 
@@ -6682,16 +6691,20 @@ vy_begin(struct vy_env *e, struct txn *txn)
 	return 0;
 }
 
-void *
-vy_savepoint(struct vy_tx *tx)
+void
+vy_savepoint(struct txn *txn)
 {
-	return stailq_last(&tx->log);
+	assert(txn != NULL);
+	struct vy_tx *tx = txn->engine_tx;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+	stmt->engine_savepoint = stailq_last(&tx->log);
 }
 
 void
-vy_rollback_to_savepoint(struct vy_tx *tx, void *svp)
+vy_rollback_statement(struct txn *txn, struct txn_stmt *stmt)
 {
-	struct stailq_entry *last = svp;
+	struct vy_tx *tx = txn->engine_tx;
+	struct stailq_entry *last = stmt->engine_savepoint;
 	/* Start from the first statement after the savepoint. */
 	last = last == NULL ? stailq_first(&tx->log) : stailq_next(last);
 	if (last == NULL) {
@@ -9799,9 +9812,11 @@ fail:
 /* {{{ Cursor */
 
 struct vy_cursor *
-vy_cursor_new(struct vy_tx *tx, struct vy_index *index, const char *key,
-	      uint32_t part_count, enum iterator_type type)
+vy_cursor_new(struct vy_index *index, const char *key, uint32_t part_count,
+	      enum iterator_type type)
 {
+	struct vy_tx *tx =
+		in_txn() ? (struct vy_tx *) in_txn()->engine_tx : NULL;
 	struct vy_env *e = index->env;
 	struct vy_cursor *c = mempool_alloc(&e->cursor_pool);
 	if (c == NULL) {

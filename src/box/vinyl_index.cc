@@ -188,15 +188,13 @@ VinylIndex::initIterator(struct iterator *ptr,
 {
 	assert(part_count == 0 || key != NULL);
 	struct vinyl_iterator *it = (struct vinyl_iterator *) ptr;
-	struct vy_tx *tx =
-		in_txn() ? (struct vy_tx *) in_txn()->engine_tx : NULL;
 	assert(it->cursor == NULL);
 	it->index = this;
 	ptr->next = iterator_next;
 	if (type > ITER_GT || type < 0)
 		return Index::initIterator(ptr, type, key, part_count);
 
-	it->cursor = vy_cursor_new(tx, db, key, part_count, type);
+	it->cursor = vy_cursor_new(db, key, part_count, type);
 	if (it->cursor == NULL)
 		diag_raise();
 }
