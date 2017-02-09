@@ -239,9 +239,7 @@ VinylEngine::keydefCheck(struct space *space, struct key_def *key_def)
 void
 VinylEngine::begin(struct txn *txn)
 {
-	assert(txn->engine_tx == NULL);
-	txn->engine_tx = vy_begin(env);
-	if (txn->engine_tx == NULL)
+	if (vy_begin(env, txn) != 0)
 		diag_raise();
 }
 

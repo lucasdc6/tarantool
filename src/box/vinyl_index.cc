@@ -76,15 +76,8 @@ VinylIndex::open()
 struct tuple*
 VinylIndex::findByKey(const char *key, uint32_t part_count) const
 {
-	assert(key_def->opts.is_unique && part_count == key_def->part_count);
-	/*
-	 * engine_tx might be empty, even if we are in txn context.
-	 * This can happen on a first-read statement.
-	 */
-	struct vy_tx *transaction = in_txn() ?
-		(struct vy_tx *) in_txn()->engine_tx : NULL;
 	struct tuple *tuple = NULL;
-	if (vy_get(transaction, db, key, part_count, &tuple) != 0)
+	if (vy_get(db, key, part_count, &tuple) != 0)
 		diag_raise();
 	if (tuple != NULL) {
 		tuple = tuple_bless_xc(tuple);

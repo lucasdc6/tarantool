@@ -41,6 +41,7 @@ extern "C" {
 
 struct vy_env;
 struct vy_tx;
+struct txn;
 struct vy_cursor;
 struct vy_index;
 struct key_def;
@@ -130,12 +131,11 @@ vy_info_gather(struct vy_env *env, struct vy_info_handler *h);
  * Transaction
  */
 
-struct vy_tx *
-vy_begin(struct vy_env *e);
+int
+vy_begin(struct vy_env *e, struct txn *txn);
 
 /**
  * Get a tuple from the vinyl index.
- * @param tx          Current transaction.
  * @param index       Vinyl index.
  * @param key         MessagePack'ed data, the array without a
  *                    header.
@@ -146,14 +146,12 @@ vy_begin(struct vy_env *e);
  * @retval -1 Memory or read error.
  */
 int
-vy_get(struct vy_tx *tx, struct vy_index *index,
-       const char *key, uint32_t part_count, struct tuple **result);
+vy_get(struct vy_index *index, const char *key, uint32_t part_count,
+       struct tuple **result);
 
 /**
  * Execute REPLACE in a vinyl space.
- * @param tx      Current transaction.
- * @param stmt    Statement for triggers filled with old
- *                statement.
+ * @param txn     Current transaction.
  * @param space   Vinyl space.
  * @param request Request with the tuple data.
  *
@@ -163,14 +161,11 @@ vy_get(struct vy_tx *tx, struct vy_index *index,
  *            error.
  */
 int
-vy_replace(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	   struct request *request);
+vy_replace(struct txn *txn, struct space *space, struct request *request);
 
 /**
  * Execute DELETE in a vinyl space.
- * @param tx      Current transaction.
- * @param stmt    Statement for triggers filled with deleted
- *                statement.
+ * @param txn     Current transaction.
  * @param space   Vinyl space.
  * @param request Request with the tuple data.
  *
@@ -179,14 +174,11 @@ vy_replace(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
  *            reference increment error.
  */
 int
-vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	  struct request *request);
+vy_delete(struct txn *txn, struct space *space, struct request *request);
 
 /**
  * Execute UPDATE in a vinyl space.
- * @param tx      Current transaction.
- * @param stmt    Statement for triggers filled with old and new
- *                statements.
+ * @param txn     Current transaction.
  * @param space   Vinyl space.
  * @param request Request with the tuple data.
  *
@@ -195,14 +187,11 @@ vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
  *            reference increment error.
  */
 int
-vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	  struct request *request);
+vy_update(struct txn *txn, struct space *space, struct request *request);
 
 /**
  * Execute UPSERT in a vinyl space.
- * @param tx      Current transaction.
- * @param stmt    Statement for triggers filled with old and new
- *                statements.
+ * @param txn     Current transaction.
  * @param space   Vinyl space.
  * @param request Request with the tuple data and update
  *                operations.
@@ -212,8 +201,7 @@ vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
  *            reference increment error.
  */
 int
-vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	  struct request *request);
+vy_upsert(struct txn *txn, struct space *space, struct request *request);
 
 int
 vy_prepare(struct vy_env *e, struct vy_tx *tx);

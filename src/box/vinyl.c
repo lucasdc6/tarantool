@@ -5877,7 +5877,7 @@ vy_replace_one(struct vy_tx *tx, struct space *space,
 		if (key == NULL)                /* out of memory */
 			return -1;
 		uint32_t part_count = mp_decode_array(&key);
-		if (vy_get(tx, pk, key, part_count, &stmt->old_tuple))
+		if (vy_index_get(tx, pk, key, part_count, &stmt->old_tuple))
 			return -1;
 	}
 	return vy_tx_set(tx, pk, stmt->new_tuple);
@@ -6099,9 +6099,10 @@ error:
 }
 
 int
-vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	  struct request *request)
+vy_delete(struct txn *txn, struct space *space, struct request *request)
 {
+	struct vy_tx *tx = txn->engine_tx;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
 	assert(stmt != NULL);
 	struct vy_index *pk = vy_index_find(space, 0);
 	if (pk == NULL)
@@ -6219,9 +6220,10 @@ vy_update_changes_all_indexes(const struct space *space, uint64_t column_mask)
 }
 
 int
-vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	  struct request *request)
+vy_update(struct txn *txn, struct space *space, struct request *request)
 {
+	struct vy_tx *tx = txn->engine_tx;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
 	assert(stmt != NULL);
 	assert(tx != NULL && tx->state == VINYL_TX_READY);
 	struct vy_index *index = vy_index_find_unique(space, request->index_id);
@@ -6379,9 +6381,10 @@ vy_index_upsert(struct vy_tx *tx, struct vy_index *index,
 }
 
 int
-vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	  struct request *request)
+vy_upsert(struct txn *txn, struct space *space, struct request *request)
 {
+	struct vy_tx *tx = txn->engine_tx;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
 	assert(stmt != NULL);
 	assert(tx != NULL && tx->state == VINYL_TX_READY);
 	/* Check update operations. */
@@ -6559,11 +6562,13 @@ vy_insert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 }
 
 int
-vy_replace(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
-	   struct request *request)
+vy_replace(struct txn *txn, struct space *space, struct request *request)
 {
-	assert(stmt != NULL);
+	assert(request->index_id == 0);
+	struct vy_tx *tx = txn->engine_tx;
 	struct vy_env *env = tx->manager->env;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+	assert(stmt != NULL);
 	/* Check the tuple fields. */
 	if (tuple_validate_raw(space->format, request->tuple))
 		return -1;
@@ -6661,18 +6666,20 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 	return 0;
 }
 
-struct vy_tx *
-vy_begin(struct vy_env *e)
+int
+vy_begin(struct vy_env *e, struct txn *txn)
 {
+	assert(txn->engine_tx == NULL);
 	struct vy_tx *tx;
 	tx = malloc(sizeof(struct vy_tx));
 	if (unlikely(tx == NULL)) {
 		diag_set(OutOfMemory, sizeof(struct vy_tx), "malloc",
 			 "struct vy_tx");
-		return NULL;
+		return -1;
 	}
 	vy_tx_begin(e->xm, tx, VINYL_TX_RW);
-	return tx;
+	txn->engine_tx = tx;
+	return 0;
 }
 
 void *
@@ -6711,9 +6718,17 @@ vy_rollback_to_savepoint(struct vy_tx *tx, void *svp)
 /* }}} Public API of transaction control */
 
 int
-vy_get(struct vy_tx *tx, struct vy_index *index, const char *key,
-       uint32_t part_count, struct tuple **result)
+vy_get(struct vy_index *index, const char *key, uint32_t part_count,
+       struct tuple **result)
 {
+	struct key_def *key_def = index->user_key_def;
+	assert(key_def->opts.is_unique && part_count == key_def->part_count);
+	struct txn *txn = in_txn();
+	/*
+	 * engine_tx might be empty, even if we are in txn
+	 * context. This can happen on a first-read statement.
+	 */
+	struct vy_tx *tx = txn == NULL ? NULL : txn->engine_tx;
 	assert(tx == NULL || tx->state == VINYL_TX_READY);
 	assert(result != NULL);
 	struct tuple *vyresult = NULL;

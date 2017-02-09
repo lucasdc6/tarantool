@@ -72,11 +72,8 @@ struct tuple *
 VinylSpace::executeReplace(struct txn *txn, struct space *space,
 			   struct request *request)
 {
-	assert(request->index_id == 0);
-	struct vy_tx *tx = (struct vy_tx *)txn->engine_tx;
 	struct txn_stmt *stmt = txn_current_stmt(txn);
-
-	if (vy_replace(tx, stmt, space, request))
+	if (vy_replace(txn, space, request))
 		diag_raise();
 
 	assert(stmt->new_tuple != NULL);
@@ -87,9 +84,7 @@ struct tuple *
 VinylSpace::executeDelete(struct txn *txn, struct space *space,
                           struct request *request)
 {
-	struct txn_stmt *stmt = txn_current_stmt(txn);
-	struct vy_tx *tx = (struct vy_tx *) txn->engine_tx;
-	if (vy_delete(tx, stmt, space, request))
+	if (vy_delete(txn, space, request))
 		diag_raise();
 	/*
 	 * Delete may or may not set stmt->old_tuple, but we
@@ -102,9 +97,8 @@ struct tuple *
 VinylSpace::executeUpdate(struct txn *txn, struct space *space,
                           struct request *request)
 {
-	struct vy_tx *tx = (struct vy_tx *)txn->engine_tx;
 	struct txn_stmt *stmt = txn_current_stmt(txn);
-	if (vy_update(tx, stmt, space, request) != 0)
+	if (vy_update(txn, space, request) != 0)
 		diag_raise();
 	return stmt->new_tuple;
 }
@@ -113,9 +107,7 @@ void
 VinylSpace::executeUpsert(struct txn *txn, struct space *space,
                            struct request *request)
 {
-	struct vy_tx *tx = (struct vy_tx *)txn->engine_tx;
-	struct txn_stmt *stmt = txn_current_stmt(txn);
-	if (vy_upsert(tx, stmt, space, request) != 0)
+	if (vy_upsert(txn, space, request) != 0)
 		diag_raise();
 }
 

@@ -96,15 +96,24 @@ struct txn {
 	struct rlist on_commit, on_rollback;
 };
 
-#if defined(__cplusplus)
-} /* extern "C" */
-
 /* Pointer to the current transaction (if any) */
 static inline struct txn *
 in_txn()
 {
 	return (struct txn *) fiber_get_key(fiber(), FIBER_KEY_TXN);
 }
+
+/** The current statement of the transaction. */
+static inline struct txn_stmt *
+txn_current_stmt(struct txn *txn)
+{
+	return (txn->in_sub_stmt > 0 ?
+		stailq_last_entry(&txn->stmts, struct txn_stmt, next) :
+		NULL);
+}
+
+#if defined(__cplusplus)
+} /* extern "C" */
 
 /**
  * Start a transaction explicitly.
@@ -214,15 +223,6 @@ txn_rollback_stmt();
  */
 void
 txn_check_autocommit(struct txn *txn, const char *where);
-
-/** The current statement of the transaction. */
-static inline struct txn_stmt *
-txn_current_stmt(struct txn *txn)
-{
-	return (txn->in_sub_stmt > 0 ?
-		stailq_last_entry(&txn->stmts, struct txn_stmt, next) :
-		NULL);
-}
 
 /** The last statement of the transaction. */
 static inline struct txn_stmt *
