@@ -6584,11 +6584,26 @@ vy_replace(struct txn *txn, struct space *space, struct request *request)
 	}
 }
 
+static inline void
+txn_stmt_unref_tuples(struct txn_stmt *stmt)
+{
+	if (stmt->old_tuple)
+		tuple_unref(stmt->old_tuple);
+	if (stmt->new_tuple)
+		tuple_unref(stmt->new_tuple);
+	stmt->old_tuple = NULL;
+	stmt->new_tuple = NULL;
+}
+
 void
 vy_rollback(struct vy_env *e, struct txn *txn)
 {
 	if (txn->engine_tx == NULL)
 		return;
+	struct txn_stmt *stmt;
+	stailq_foreach_entry(stmt, &txn->stmts, next) {
+		txn_stmt_unref_tuples(stmt);
+	}
 	struct vy_tx *tx = (struct vy_tx *) txn->engine_tx;
 	vy_tx_rollback(e, tx);
 	TRASH(tx);
@@ -6633,6 +6648,10 @@ vy_prepare(struct vy_env *e, struct txn *txn)
 int
 vy_commit(struct vy_env *e, struct txn *txn, int64_t lsn)
 {
+	struct txn_stmt *stmt;
+	stailq_foreach_entry(stmt, &txn->stmts, next) {
+		txn_stmt_unref_tuples(stmt);
+	}
 	struct vy_tx *tx = txn->engine_tx;
 	if (tx == NULL)
 		return 0;
@@ -6703,6 +6722,7 @@ vy_savepoint(struct txn *txn)
 void
 vy_rollback_statement(struct txn *txn, struct txn_stmt *stmt)
 {
+	txn_stmt_unref_tuples(stmt);
 	struct vy_tx *tx = txn->engine_tx;
 	struct stailq_entry *last = stmt->engine_savepoint;
 	/* Start from the first statement after the savepoint. */

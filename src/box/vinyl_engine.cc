@@ -256,24 +256,9 @@ VinylEngine::prepare(struct txn *txn)
 		diag_raise();
 }
 
-static inline void
-txn_stmt_unref_tuples(struct txn_stmt *stmt)
-{
-	if (stmt->old_tuple)
-		tuple_unref(stmt->old_tuple);
-	if (stmt->new_tuple)
-		tuple_unref(stmt->new_tuple);
-	stmt->old_tuple = NULL;
-	stmt->new_tuple = NULL;
-}
-
 void
 VinylEngine::commit(struct txn *txn, int64_t lsn)
 {
-	struct txn_stmt *stmt;
-	stailq_foreach_entry(stmt, &txn->stmts, next) {
-		txn_stmt_unref_tuples(stmt);
-	}
 	if (vy_commit(env, txn, txn->n_rows ? lsn : 0) != 0)
 		panic("vinyl commit failed: txn->signature = %" PRIu64, lsn);
 }
@@ -282,16 +267,11 @@ void
 VinylEngine::rollback(struct txn *txn)
 {
 	vy_rollback(env, txn);
-	struct txn_stmt *stmt;
-	stailq_foreach_entry(stmt, &txn->stmts, next) {
-		txn_stmt_unref_tuples(stmt);
-	}
 }
 
 void
 VinylEngine::rollbackStatement(struct txn *txn, struct txn_stmt *stmt)
 {
-	txn_stmt_unref_tuples(stmt);
 	vy_rollback_statement(txn, stmt);
 }
 
