@@ -66,6 +66,8 @@ struct errinj {
 	_(ERRINJ_TUPLE_FIELD, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_RANGE_DUMP, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_RANGE_SPLIT, ERRINJ_BOOL, {.bparam = false}) \
+	_(ERRINJ_VY_RUN_DISCARD, ERRINJ_BOOL, {.bparam = false}) \
+	_(ERRINJ_VY_TASK_COMPLETE, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_READ_PAGE, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_READ_PAGE_TIMEOUT, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_GC, ERRINJ_BOOL, {.bparam = false}) \
