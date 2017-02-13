@@ -205,7 +205,8 @@ vy_mem_older_lsn(struct vy_mem *mem, const struct tuple *stmt);
  * @retval     NULL Memory error.
  */
 struct tuple *
-vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn);
+vy_mem_insert(struct vy_mem *mem, struct tuple *stmt, bool is_region,
+	      int64_t alloc_lsn);
 
 /**
  * Iterator for in-memory level.

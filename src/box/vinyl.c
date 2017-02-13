@@ -3335,6 +3335,9 @@ vy_index_open_ex(struct vy_index *index)
  * Save a statement in the range's in-memory index.
  * @param range         Range to save.
  * @param stmt          Statement to save.
+ * @param is_region     True if the statement allocated on
+ *                      lsregion and no need to copy it on
+ *                      lsregion again.
  * @param alloc_lsn     Identifier for lsregion allocation.
  * @param mem_stmt[out] Is set to the lsregion statement, inserted
  *                      in vy_mem.
@@ -3342,7 +3345,7 @@ vy_index_open_ex(struct vy_index *index)
  * @retval -1 Memory error.
  */
 static int
-vy_range_set(struct vy_range *range, const struct tuple *stmt,
+vy_range_set(struct vy_range *range, struct tuple *stmt, bool is_region,
 	     int64_t alloc_lsn, struct tuple **mem_stmt)
 {
 	assert(mem_stmt != NULL);
@@ -3353,7 +3356,7 @@ vy_range_set(struct vy_range *range, const struct tuple *stmt,
 
 	bool was_empty = (mem->used == 0);
 
-	*mem_stmt = vy_mem_insert(mem, stmt, alloc_lsn);
+	*mem_stmt = vy_mem_insert(mem, stmt, is_region, alloc_lsn);
 	if (*mem_stmt == NULL)
 		return -1;
 
@@ -3382,6 +3385,9 @@ vy_range_set(struct vy_range *range, const struct tuple *stmt,
  * index.
  * @param range         Range to save.
  * @param stmt          Statement to save.
+ * @param is_region     True if the statement allocated on
+ *                      lsregion and no need to copy it on
+ *                      lsregion again.
  * @param mem_stmt[out] Is set to the lsregion statement, inserted
  *                      in vy_mem, or NULL, if the DELETE was
  *                      skipped.
@@ -3389,7 +3395,7 @@ vy_range_set(struct vy_range *range, const struct tuple *stmt,
  * @retval -1 Memory error.
  */
 static int
-vy_range_set_delete(struct vy_range *range, const struct tuple *stmt,
+vy_range_set_delete(struct vy_range *range, struct tuple *stmt, bool is_region,
 		    struct tuple **mem_stmt)
 {
 	assert(mem_stmt != NULL);
@@ -3408,7 +3414,8 @@ vy_range_set_delete(struct vy_range *range, const struct tuple *stmt,
 		return 0;
 	}
 
-	return vy_range_set(range, stmt, vy_stmt_lsn(stmt), mem_stmt);
+	return vy_range_set(range, stmt, is_region, vy_stmt_lsn(stmt),
+			    mem_stmt);
 }
 
 static void
@@ -3474,7 +3481,8 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt,
 		}
 		assert(older == NULL || upserted_lsn != vy_stmt_lsn(older));
 		assert(vy_stmt_type(upserted) == IPROTO_REPLACE);
-		int rc = vy_range_set(range, upserted, upserted_lsn, mem_stmt);
+		int rc = vy_range_set(range, upserted, false, upserted_lsn,
+				      mem_stmt);
 		tuple_unref(upserted);
 		return rc;
 	}
@@ -3504,7 +3512,7 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt,
 		}
 	}
 
-	return vy_range_set(range, stmt, vy_stmt_lsn(stmt), mem_stmt);
+	return vy_range_set(range, stmt, false, vy_stmt_lsn(stmt), mem_stmt);
 }
 
 /*
@@ -3536,27 +3544,34 @@ vy_stmt_is_committed(struct vy_index *index, const struct tuple *stmt)
 
 /*
  * Commit a single write operation made by a transaction.
- * @param txv      Statement to commit.
- * @param status   Vinyl environment status.
- * @param lsn      LSN of the transaction.
- * @param mem_stmt[out] Is set to the lsregion statement, inserted
- *        in vy_mem, or NULL, if the statement was skipped.
- * @retval  0 Success.
+ * @param index     Index to commit.
+ * @param stmt      Statement to commit.
+ * @param is_region True if the @a stmt is from lsregion and no
+ *                  need to copy it in vy_mem.
+ * @param lsn       LSN of the statement to write.
+ * @param[out] mem_stmt Is set to the new lsregion statement, if
+ *             the @a stmt was copied in vy_mem.
+ *
+ * @retval  0 Success, but if the @a mem_stmt is NULL, then the
+ *            @a stmt was already commited earlier and nothing to
+ *            insert, @sa vy_stmt_is_committed(); or the @a stmt
+ *            is the first DELETE for the specified index and was
+ *            skipped (@sa vy_range_set_delete()).
  * @retval -1 Memory error.
  */
 static int
-vy_tx_write(struct txv *v, enum vy_status status, int64_t lsn,
-	    struct tuple **mem_stmt)
+vy_tx_write(struct vy_index *index, struct tuple *stmt, bool is_region,
+	    int64_t lsn, struct tuple **mem_stmt)
 {
 	assert(mem_stmt != NULL);
 	*mem_stmt = NULL;
-	struct vy_index *index = v->index;
 	struct key_def *key_def = index->key_def;
+	enum vy_status status = index->env->status;
 	struct lsregion *allocator = &index->env->allocator;
 	const int64_t *allocator_lsn = &index->env->xm->lsn;
-	struct tuple *stmt = v->stmt;
 	struct vy_range *range = NULL;
 
+	assert(!is_region || vy_stmt_lsn(stmt) == lsn);
 	vy_stmt_set_lsn(stmt, lsn);
 
 	/*
@@ -3585,13 +3600,15 @@ vy_tx_write(struct txv *v, enum vy_status status, int64_t lsn,
 	int rc;
 	switch (vy_stmt_type(stmt)) {
 	case IPROTO_UPSERT:
+		assert(key_def->iid == 0 && index->space->index_count == 1);
 		rc = vy_range_set_upsert(range, stmt, mem_stmt);
 		break;
 	case IPROTO_DELETE:
-		rc = vy_range_set_delete(range, stmt, mem_stmt);
+		rc = vy_range_set_delete(range, stmt, is_region, mem_stmt);
 		break;
 	default:
-		rc = vy_range_set(range, stmt, vy_stmt_lsn(stmt), mem_stmt);
+		rc = vy_range_set(range, stmt, is_region, vy_stmt_lsn(stmt),
+				  mem_stmt);
 		break;
 	}
 
@@ -6765,7 +6782,7 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 	for (v = write_set_first(&tx->write_set);
 	     v != NULL; v = write_set_next(&tx->write_set, v)) {
 		struct tuple *mem_stmt;
-		int rc = vy_tx_write(v, e->status, lsn, &mem_stmt);
+		int rc = vy_tx_write(v->index, v->stmt, false, lsn, &mem_stmt);
 		write_count++;
 		assert(rc == 0); /* TODO: handle BPS tree errors properly */
 		(void)rc;
@@ -9411,13 +9428,21 @@ vy_read_iterator_add_disk(struct vy_read_iterator *itr)
 	assert(itr->curr_range->shadow == NULL);
 	struct vy_iterator_stat *stat = &itr->index->env->stat->run_stat;
 	struct vy_run *run;
+	struct tuple_format *format = itr->index->surrogate_format;
+	/*
+	 * The format of the statement must be exactly the space
+	 * format with the same identifier to match the fully
+	 * the format in vy_mem.
+	 */
+	if (itr->index->space->index_count == 1)
+		format = itr->index->space->format;
 	rlist_foreach_entry(run, &itr->curr_range->runs, in_range) {
 		struct vy_merge_src *sub_src = vy_merge_iterator_add(
 			&itr->merge_iterator, false, true);
 		vy_run_iterator_open(&sub_src->run_iterator, stat,
 				     itr->curr_range,
 				     run, itr->iterator_type, itr->key,
-				     itr->vlsn, itr->index->surrogate_format);
+				     itr->vlsn, format);
 	}
 }
 
@@ -9481,7 +9506,7 @@ vy_read_iterator_start(struct vy_read_iterator *itr)
 	vy_range_iterator_next(&itr->range_iterator, &itr->curr_range);
 	vy_merge_iterator_open(&itr->merge_iterator, itr->index,
 			       itr->iterator_type, itr->key,
-			       itr->index->surrogate_format);
+			       itr->index->space->format);
 	vy_read_iterator_use_range(itr);
 }
 
@@ -9501,7 +9526,7 @@ restart:
 	vy_merge_iterator_close(&itr->merge_iterator);
 	vy_merge_iterator_open(&itr->merge_iterator, itr->index,
 			       itr->iterator_type, itr->key,
-			       itr->index->surrogate_format);
+			       itr->index->space->format);
 	vy_read_iterator_use_range(itr);
 	rc = vy_merge_iterator_restore(&itr->merge_iterator, itr->curr_stmt);
 	if (rc == -1)
@@ -9567,7 +9592,7 @@ vy_read_iterator_next_range(struct vy_read_iterator *itr, struct tuple **ret)
 	vy_merge_iterator_close(&itr->merge_iterator);
 	vy_merge_iterator_open(&itr->merge_iterator, itr->index,
 			       itr->iterator_type, itr->key,
-			       itr->index->surrogate_format);
+			       itr->index->space->format);
 	vy_range_iterator_next(&itr->range_iterator, &itr->curr_range);
 	vy_read_iterator_use_range(itr);
 	struct tuple *stmt = NULL;
@@ -9837,7 +9862,7 @@ vy_squash_process(struct vy_squash *squash)
 	 */
 	size_t mem_used_before = lsregion_used(&env->allocator);
 	struct tuple *mem_stmt;
-	rc = vy_range_set(range, result, env->xm->lsn, &mem_stmt);
+	rc = vy_range_set(range, result, false, env->xm->lsn, &mem_stmt);
 	size_t mem_used_after = lsregion_used(&env->allocator);
 	assert(mem_used_after >= mem_used_before);
 	tuple_unref(result);
