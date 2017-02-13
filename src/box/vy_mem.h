@@ -201,10 +201,10 @@ vy_mem_older_lsn(struct vy_mem *mem, const struct tuple *stmt);
  * @param stmt       Vinyl statement.
  * @param alloc_lsn  LSN for lsregion allocator.
  *
- * @retval  0 Success.
- * @retval -1 Memory error.
+ * @retval not NULL lsregion allocated tuple, inserted in vy_mem.
+ * @retval     NULL Memory error.
  */
-int
+struct tuple *
 vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn);
 
 /**
