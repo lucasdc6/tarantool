@@ -1120,12 +1120,23 @@ txv_abort_all(struct vy_env *env, struct vy_tx *tx, struct txv *v)
 static int
 write_set_cmp(struct txv *a, struct txv *b)
 {
-	/* Order by index first, by key in the index second. */
-	int rc = a->index < b->index ? -1 : a->index > b->index;
-	if (rc == 0) {
-		struct key_def *key_def = a->index->key_def;
-		return vy_stmt_compare(a->stmt, b->stmt, key_def);
-	}
+	/*
+	 * Order by (space, index ID, key).
+	 * Sort by index ID to store the primary index first. It
+	 * is need to first commit in the primary index and then
+	 * use the created lsregion statement in commits to
+	 * secondary indexes.
+	 */
+	struct vy_index *a_idx = a->index;
+	struct vy_index *b_idx = b->index;
+	int rc = (int) a_idx->space - (int) b_idx->space;
+	if (rc != 0)
+		return rc;
+	uint32_t a_iid = a_idx->key_def->iid;
+	uint32_t b_iid = b_idx->key_def->iid;
+	rc = a_iid < b_iid ? -1 : a_iid > b_iid;
+	if (rc == 0)
+		return vy_stmt_compare(a->stmt, b->stmt, a_idx->key_def);
 	return rc;
 }
 
@@ -1137,8 +1148,15 @@ struct write_set_key {
 static int
 write_set_key_cmp(struct write_set_key *a, struct txv *b)
 {
+	struct vy_index *a_idx = a->index;
+	struct vy_index *b_idx = b->index;
+	int rc = (int) a_idx->space - (int) b_idx->space;
+	if (rc != 0)
+		return rc;
+	uint32_t a_iid = a_idx->key_def->iid;
+	uint32_t b_iid = b_idx->key_def->iid;
 	/* Order by index first, by key in the index second. */
-	int rc = a->index < b->index ? -1 : a->index > b->index;
+	rc = a_iid < b_iid ? -1 : a_iid > b_iid;
 	if (rc == 0) {
 		if (a->stmt == NULL) {
 			/*
@@ -1147,8 +1165,7 @@ write_set_key_cmp(struct write_set_key *a, struct txv *b)
 			 */
 			return -1;
 		}
-		struct key_def *key_def = a->index->key_def;
-		return vy_stmt_compare(a->stmt, b->stmt, key_def);
+		return vy_stmt_compare(a->stmt, b->stmt, a_idx->key_def);
 	}
 	return rc;
 }
