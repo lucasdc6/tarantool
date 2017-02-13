@@ -38,7 +38,17 @@
 #if defined(__NetBSD__)
 typedef off_t funopen_off_t;
 #else
+
 typedef fpos_t funopen_off_t;
+#ifndef __type_max
+
+#define type_signed(t) (! ((t) 0 < (t) -1))
+#define __type_max(t) \
+  ((t) (! type_signed (t) ? (t) -1 \
+        : (t) (~ (((unsigned long long) (~ (t) 0)) << (sizeof (t) * CHAR_BIT - 1)))))
+
+#endif /* __type_max */
+
 #endif
 
 #define	FUNOPEN_OFF_MAX __type_max(funopen_off_t)
