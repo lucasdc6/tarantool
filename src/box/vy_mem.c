@@ -131,29 +131,42 @@ vy_mem_older_lsn(struct vy_mem *mem, const struct tuple *stmt)
 	return result;
 }
 
+/** Check if the statement can be inserted in the vy_mem. */
+static inline bool
+vy_mem_compatible_with_stmt(struct vy_mem *mem, struct tuple *stmt)
+{
+	return (tuple_format(stmt)->extra_size == sizeof(uint64_t) &&
+	        stmt->format_id == tuple_format_id(mem->format_with_colmask)) ||
+	       (stmt->format_id == tuple_format_id(mem->format));
+}
+
 struct tuple *
-vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
+vy_mem_insert(struct vy_mem *mem, struct tuple *stmt, bool is_region,
+	      int64_t alloc_lsn)
 {
 	size_t size = tuple_size(stmt);
-	struct tuple *mem_stmt;
-	mem_stmt = lsregion_alloc(mem->allocator, size, alloc_lsn);
-	if (mem_stmt == NULL) {
-		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
-		return NULL;
+	/* Prune the release build warning. */
+	(void) vy_mem_compatible_with_stmt;
+	assert(vy_mem_compatible_with_stmt(mem, stmt));
+	struct tuple *mem_stmt = stmt;
+	if (! is_region) {
+		mem_stmt = lsregion_alloc(mem->allocator, size, alloc_lsn);
+		if (mem_stmt == NULL) {
+			diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
+			return NULL;
+		}
+		memcpy(mem_stmt, stmt, size);
+		/*
+		 * Region allocated statements can't be referenced
+		 * or unreferenced because they are located in
+		 * monolithic memory region. Referencing has sense
+		 * only for separately allocated memory blocks.
+		 * The reference count here is set to 0 for an
+		 * assertion if somebody will try to unreference
+		 * this statement.
+		 */
+		mem_stmt->refs = 0;
 	}
-	memcpy(mem_stmt, stmt, size);
-	/*
-	 * Region allocated statements can't be referenced or unreferenced
-	 * because they are located in monolithic memory region. Referencing has
-	 * sense only for separately allocated memory blocks.
-	 * The reference count here is set to 0 for an assertion if somebody
-	 * will try to unreference this statement.
-	 */
-	mem_stmt->refs = 0;
-	if (tuple_format(stmt)->extra_size == sizeof(uint64_t))
-		mem_stmt->format_id = tuple_format_id(mem->format_with_colmask);
-	else
-		mem_stmt->format_id = tuple_format_id(mem->format);
 
 	const struct tuple *replaced_stmt = NULL;
 	if (vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt) != 0)
