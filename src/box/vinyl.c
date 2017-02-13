@@ -3434,18 +3434,28 @@ vy_index_open_ex(struct vy_index *index)
 
 /*
  * Save a statement in the range's in-memory index.
+ * @param range         Range to save.
+ * @param stmt          Statement to save.
+ * @param alloc_lsn     Identifier for lsregion allocation.
+ * @param mem_stmt[out] Is set to the lsregion statement, inserted
+ *                      in vy_mem.
+ * @retval  0 Success.
+ * @retval -1 Memory error.
  */
 static int
 vy_range_set(struct vy_range *range, const struct tuple *stmt,
-	     int64_t alloc_lsn)
+	     int64_t alloc_lsn, struct tuple **mem_stmt)
 {
+	assert(mem_stmt != NULL);
+	*mem_stmt = NULL;
 	struct vy_index *index = range->index;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 	struct vy_mem *mem = range->mem;
 
 	bool was_empty = (mem->used == 0);
 
-	if (vy_mem_insert(mem, stmt, alloc_lsn) != 0)
+	*mem_stmt = vy_mem_insert(mem, stmt, alloc_lsn);
+	if (*mem_stmt == NULL)
 		return -1;
 
 	if (was_empty)
@@ -3467,9 +3477,24 @@ vy_range_set(struct vy_range *range, const struct tuple *stmt,
 	return 0;
 }
 
+/*
+ * Save a DELETE statement in the range's in-memory index. The
+ * statement can be skipped if it is the first DELETE in the
+ * index.
+ * @param range         Range to save.
+ * @param stmt          Statement to save.
+ * @param mem_stmt[out] Is set to the lsregion statement, inserted
+ *                      in vy_mem, or NULL, if the DELETE was
+ *                      skipped.
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
 static int
-vy_range_set_delete(struct vy_range *range, const struct tuple *stmt)
+vy_range_set_delete(struct vy_range *range, const struct tuple *stmt,
+		    struct tuple **mem_stmt)
 {
+	assert(mem_stmt != NULL);
+	*mem_stmt = NULL;
 	assert(vy_stmt_type(stmt) == IPROTO_DELETE);
 
 	struct vy_mem *mem = range->mem;
@@ -3484,15 +3509,30 @@ vy_range_set_delete(struct vy_range *range, const struct tuple *stmt)
 		return 0;
 	}
 
-	return vy_range_set(range, stmt, vy_stmt_lsn(stmt));
+	return vy_range_set(range, stmt, vy_stmt_lsn(stmt), mem_stmt);
 }
 
 static void
 vy_index_squash_upserts(struct vy_index *index, struct tuple *stmt);
 
+/*
+ * Save an UPSERT statement in the range's in-memory index. The
+ * statement can be skipped if it is incorrect UPSERT. Also the
+ * statement can be squashed with other UPSERTs.
+ * @param range         Range to save.
+ * @param stmt          Statement to save.
+ * @param mem_stmt[out] Is set to the lsregion statement, inserted
+ *                      in vy_mem, or NULL, if the UPSERT has
+ *                      error.
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
 static int
-vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
+vy_range_set_upsert(struct vy_range *range, struct tuple *stmt,
+		    struct tuple **mem_stmt)
 {
+	assert(mem_stmt != NULL);
+	*mem_stmt = NULL;
 	assert(vy_stmt_type(stmt) == IPROTO_UPSERT);
 
 	struct vy_index *index = range->index;
@@ -3535,7 +3575,7 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
 		}
 		assert(older == NULL || upserted_lsn != vy_stmt_lsn(older));
 		assert(vy_stmt_type(upserted) == IPROTO_REPLACE);
-		int rc = vy_range_set(range, upserted, upserted_lsn);
+		int rc = vy_range_set(range, upserted, upserted_lsn, mem_stmt);
 		tuple_unref(upserted);
 		return rc;
 	}
@@ -3565,7 +3605,7 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
 		}
 	}
 
-	return vy_range_set(range, stmt, vy_stmt_lsn(stmt));
+	return vy_range_set(range, stmt, vy_stmt_lsn(stmt), mem_stmt);
 }
 
 /*
@@ -3597,10 +3637,20 @@ vy_stmt_is_committed(struct vy_index *index, const struct tuple *stmt)
 
 /*
  * Commit a single write operation made by a transaction.
+ * @param txv      Statement to commit.
+ * @param status   Vinyl environment status.
+ * @param lsn      LSN of the transaction.
+ * @param mem_stmt[out] Is set to the lsregion statement, inserted
+ *        in vy_mem, or NULL, if the statement was skipped.
+ * @retval  0 Success.
+ * @retval -1 Memory error.
  */
 static int
-vy_tx_write(struct txv *v, enum vy_status status, int64_t lsn)
+vy_tx_write(struct txv *v, enum vy_status status, int64_t lsn,
+	    struct tuple **mem_stmt)
 {
+	assert(mem_stmt != NULL);
+	*mem_stmt = NULL;
 	struct vy_index *index = v->index;
 	struct key_def *key_def = index->key_def;
 	struct lsregion *allocator = &index->env->allocator;
@@ -3636,13 +3686,13 @@ vy_tx_write(struct txv *v, enum vy_status status, int64_t lsn)
 	int rc;
 	switch (vy_stmt_type(stmt)) {
 	case IPROTO_UPSERT:
-		rc = vy_range_set_upsert(range, stmt);
+		rc = vy_range_set_upsert(range, stmt, mem_stmt);
 		break;
 	case IPROTO_DELETE:
-		rc = vy_range_set_delete(range, stmt);
+		rc = vy_range_set_delete(range, stmt, mem_stmt);
 		break;
 	default:
-		rc = vy_range_set(range, stmt, vy_stmt_lsn(stmt));
+		rc = vy_range_set(range, stmt, vy_stmt_lsn(stmt), mem_stmt);
 		break;
 	}
 
@@ -6830,7 +6880,8 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 	uint64_t write_count = 0;
 	for (v = write_set_first(&tx->write_set);
 	     v != NULL; v = write_set_next(&tx->write_set, v)) {
-		int rc = vy_tx_write(v, e->status, lsn);
+		struct tuple *mem_stmt;
+		int rc = vy_tx_write(v, e->status, lsn, &mem_stmt);
 		write_count++;
 		assert(rc == 0); /* TODO: handle BPS tree errors properly */
 		(void)rc;
@@ -9929,7 +9980,8 @@ vy_squash_process(struct vy_squash *squash)
 	 * and adjust the quota.
 	 */
 	size_t mem_used_before = lsregion_used(&env->allocator);
-	rc = vy_range_set(range, result, env->xm->lsn);
+	struct tuple *mem_stmt;
+	rc = vy_range_set(range, result, env->xm->lsn, &mem_stmt);
 	size_t mem_used_after = lsregion_used(&env->allocator);
 	assert(mem_used_after >= mem_used_before);
 	tuple_unref(result);

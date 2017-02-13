@@ -131,7 +131,7 @@ vy_mem_older_lsn(struct vy_mem *mem, const struct tuple *stmt)
 	return result;
 }
 
-int
+struct tuple *
 vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
 {
 	size_t size = tuple_size(stmt);
@@ -139,7 +139,7 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
 	mem_stmt = lsregion_alloc(mem->allocator, size, alloc_lsn);
 	if (mem_stmt == NULL) {
 		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
-		return -1;
+		return NULL;
 	}
 	memcpy(mem_stmt, stmt, size);
 	/*
@@ -156,9 +156,8 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
 		mem_stmt->format_id = tuple_format_id(mem->format);
 
 	const struct tuple *replaced_stmt = NULL;
-	int rc = vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt);
-	if (rc != 0)
-		return -1;
+	if (vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt) != 0)
+		return NULL;
 
 	if (mem->used == 0)
 		mem->min_lsn = vy_stmt_lsn(stmt);
@@ -167,7 +166,7 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
 	mem->used += size;
 	mem->version++;
 
-	return 0;
+	return mem_stmt;
 }
 
 /* }}} vy_mem */
