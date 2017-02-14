@@ -6691,22 +6691,166 @@ vy_prepare(struct vy_env *e, struct txn *txn)
 	return rc;
 }
 
+/**
+ * Get the next writing txv from the transaction log.
+ * @param txv Current position in the log.
+ * @retval not NULL The next 'write' txv.
+ * @retval     NULL End of the log is reached, no more 'write'
+ *                  txv's.
+ */
+static inline struct txv *
+vy_get_next_writing_txv(struct txv *v)
+{
+	do {
+		v = stailq_next_entry(v, next_in_log);
+		/*
+		 * Check if the end of the log is reached,
+		 * @sa stailq_foreach_entry().
+		 */
+		if (v == stailq_entry(NULL, struct txv, next_in_log))
+			return NULL;
+	} while (v->is_read);
+	return v;
+}
+
+/**
+ * Commit the statement of a transaction.
+ * @param log  Transaction log.
+ * @param stmt Statement to commit.
+ * @param lsn  LSN of the transaction.
+ * @param write_count[out] Is increated on count of writes.
+ *
+ * @retval  0 Success, always, but maybe will be able to
+ *            return -1.
+ */
+static int
+vy_commit_stmt(struct stailq *log, struct txn_stmt *stmt, int64_t lsn,
+	       uint64_t *write_count)
+{
+	struct stailq_entry *sp = stmt->engine_savepoint;
+	struct txv *v;
+	if (sp == NULL) {
+		/*
+		 * This is the first statement in the transaction.
+		 */
+		v = stailq_first_entry(log, struct txv, next_in_log);
+	} else {
+		/*
+		 * First txv of the statement follows its
+		 * savepoint.
+		 */
+		v = stailq_entry(stailq_next(sp), struct txv, next_in_log);
+	}
+	assert(v != NULL);
+	if (v == stailq_entry(NULL, struct txv, next_in_log))
+		return 0;
+	/* Need to commit only writing txv's. */
+	if (v->is_read)
+		v = vy_get_next_writing_txv(v);
+	if (v == NULL)
+		return 0;
+	/*
+	 * The first txv always from the primary index. All
+	 * following txv's, if exist, are from the secondary
+	 * indexes.
+	 */
+	struct tuple *mem_stmt;
+	assert(v->index->key_def->iid == 0);
+	int rc = vy_tx_write(v->index, v->stmt, false, lsn, &mem_stmt);
+	assert(rc == 0);
+	++*write_count;
+	(void) rc;
+	struct space *space = v->index->space;
+	if (space->index_count == 1)
+		return 0;
+	/*
+	 * If the space has secondary indexes then all operations
+	 * are decomposed in DELETE + REPLACE or turned in one
+	 * REPLACE:
+	 * INSERT = REPLACE in all indexes.
+	 * UPDATE = REPLACE in primary and DELETE + REPLACE in
+	 *          secondary.
+	 * UPSERT = REPLACE in primary and REPLACE or
+	 *          DELETE + REPLACE in secondary.
+	 * REPLACE = same as UPSERT
+	 * DELETE = DELETE in all indexes.
+	 */
+	enum iproto_type stmt_type = vy_stmt_type(v->stmt);
+	assert(stmt_type == IPROTO_DELETE || stmt_type == IPROTO_REPLACE);
+	/*
+	 * If vy_tx_write returned 0 and mem_stmt == NULL, then
+	 * maybe it was first DELETE in the index, or this
+	 * statement already is commited
+	 * (@sa vy_stmt_is_committed()) and nothing was written to
+	 * the vy_mem. In such case we have to copy into vy_mems
+	 * the original statement (not lsregion allocated).
+	 */
+	bool is_region = true;
+	struct tuple *mem_delete = NULL, *unused;
+	if (mem_stmt == NULL) {
+		mem_stmt = v->stmt;
+		is_region = false;
+	} else if (stmt_type == IPROTO_DELETE) {
+		/**
+		 * If there is the DELETE from the primary index
+		 * then we can use it also for secondary indexes
+		 * owing to the common txv memory level.
+		 */
+		mem_delete = mem_stmt;
+	}
+	struct txv *next_v = v;
+	for (uint32_t i = 1; i < space->index_count; ++i) {
+		next_v = vy_get_next_writing_txv(next_v);
+		assert(next_v != NULL);
+		struct vy_index *index = vy_index(space->index[i]);
+		assert(next_v->index == index);
+		if (vy_stmt_type(next_v->stmt) == IPROTO_DELETE) {
+			if (mem_delete != NULL)
+				/*
+				 * Use the existing mem statement.
+				 */
+				rc = vy_tx_write(index, mem_delete, true,
+						 lsn, &unused);
+			else
+				/*
+				 * Save the lsregion mem statement
+				 * to avoid copying in next
+				 * indexes.
+				 */
+				rc = vy_tx_write(index, next_v->stmt, false,
+						 lsn, &mem_delete);
+			assert(rc == 0);
+			++*write_count;
+			if (stmt_type == IPROTO_DELETE)
+				continue;
+			/*
+			 * If the DELETE is met and the statement
+			 * type is not DELETE, then the following
+			 * txv always is for the same index and
+			 * has the REPLACE type.
+			 */
+			next_v = vy_get_next_writing_txv(next_v);
+			assert(next_v != NULL);
+		}
+		assert(next_v->index == index);
+		assert(next_v->stmt == v->stmt);
+		rc = vy_tx_write(index, mem_stmt, is_region, lsn, &unused);
+		assert(rc == 0);
+		++*write_count;
+	}
+	return 0;
+}
+
 int
 vy_commit(struct vy_env *e, struct txn *txn, int64_t lsn)
 {
-	struct txn_stmt *stmt;
-	stailq_foreach_entry(stmt, &txn->stmts, next) {
-		txn_stmt_unref_tuples(stmt);
-	}
 	struct vy_tx *tx = txn->engine_tx;
 	if (tx == NULL)
 		return 0;
 	assert(tx->state == VINYL_TX_COMMIT);
 	if (lsn > e->xm->lsn)
 		e->xm->lsn = lsn;
-
-	struct txv *v, *tmp;
-	struct vy_quota *quota = &e->quota;
+	struct txn_stmt *stmt;
 	struct lsregion *allocator = &e->allocator;
 	size_t mem_used_before = lsregion_used(allocator);
 	/*
@@ -6714,16 +6858,15 @@ vy_commit(struct vy_env *e, struct txn *txn, int64_t lsn)
 	 * Sic: the loop below must not yield after recovery.
 	 */
 	uint64_t write_count = 0;
-	for (v = write_set_first(&tx->write_set);
-	     v != NULL; v = write_set_next(&tx->write_set, v)) {
-		struct tuple *mem_stmt;
-		int rc = vy_tx_write(v->index, v->stmt, false, lsn, &mem_stmt);
-		write_count++;
-		assert(rc == 0); /* TODO: handle BPS tree errors properly */
-		(void)rc;
+	stailq_foreach_entry(stmt, &txn->stmts, next) {
+		int rc = vy_commit_stmt(&tx->log, stmt, lsn, &write_count);
+		assert(rc == 0);
+		(void) rc;
+		txn_stmt_unref_tuples(stmt);
 	}
 
 	uint32_t count = 0;
+	struct txv *tmp, *v;
 	stailq_foreach_entry_safe(v, tmp, &tx->log, next_in_log) {
 		count++;
 		txv_delete(v);
@@ -6736,7 +6879,7 @@ vy_commit(struct vy_env *e, struct txn *txn, int64_t lsn)
 	TRASH(tx);
 	free(tx);
 
-	vy_quota_use(quota, write_size);
+	vy_quota_use(&e->quota, write_size);
 	txn->engine_tx = NULL;
 	return 0;
 }
