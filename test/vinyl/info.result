@@ -82,6 +82,9 @@ box_info_sort(box.info.vinyl())
   - metric:
     - lsn: 5
   - performance:
+    - applied_upserts:
+      - rps: <rps>
+      - total: <total>
     - cache:
       - count: <count>
       - used: <used>
@@ -116,6 +119,12 @@ box_info_sort(box.info.vinyl())
       - txw:
         - lookup_count: <count>
         - step_count: <count>
+    - replaced_upserts:
+      - rps: <rps>
+      - total: <total>
+    - squashed_upserts:
+      - rps: <rps>
+      - total: <total>
     - tx:
       - rps: <rps>
       - total: <total>

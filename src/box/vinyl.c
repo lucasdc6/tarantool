@@ -172,6 +172,9 @@ enum vy_stat_name {
 	VY_STAT_TX_WRITE,
 	VY_STAT_CURSOR,
 	VY_STAT_CURSOR_OPS,
+	VY_STAT_UPSERT_REPLACED,
+	VY_STAT_UPSERT_SQUASHED,
+	VY_STAT_UPSERT_APPLIED,
 	VY_STAT_LAST,
 };
 
@@ -182,6 +185,9 @@ static const char *vy_stat_strings[] = {
 	"tx_write",
 	"cursor",
 	"cursor_ops",
+	"replaced_upserts",
+	"squashed_upserts",
+	"applied_upserts"
 };
 
 struct vy_stat {
@@ -347,7 +353,7 @@ vy_stat_tx_write_rate(struct vy_stat *s)
 static struct tuple *
 vy_apply_upsert(const struct tuple *upsert, const struct tuple *object,
 		const struct key_def *key_def, struct tuple_format *format,
-		bool suppress_error);
+		bool suppress_error, struct vy_stat *stat);
 
 /**
  * Run metadata. A run is a written to a file as a single
@@ -3386,7 +3392,8 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
 		assert(older == NULL || vy_stmt_type(older) != IPROTO_UPSERT);
 		struct tuple *upserted =
 			vy_apply_upsert(stmt, older, key_def,
-					index->space->format, false);
+					index->space->format, false,
+					index->env->stat);
 		if (upserted == NULL)
 			return -1; /* OOM */
 		int64_t upserted_lsn = vy_stmt_lsn(upserted);
@@ -5532,7 +5539,7 @@ vy_upsert_try_to_squash(struct tuple_format *format, struct region *region,
 static struct tuple *
 vy_apply_upsert(const struct tuple *new_stmt, const struct tuple *old_stmt,
 		const struct key_def *key_def, struct tuple_format *format,
-		bool suppress_error)
+		bool suppress_error, struct vy_stat *stat)
 {
 	/*
 	 * old_stmt - previous (old) version of stmt
@@ -5542,6 +5549,9 @@ vy_apply_upsert(const struct tuple *new_stmt, const struct tuple *old_stmt,
 	assert(new_stmt != NULL);
 	assert(new_stmt != old_stmt);
 	assert(vy_stmt_type(new_stmt) == IPROTO_UPSERT);
+
+	if (cord_is_main() && stat != NULL)
+		rmean_collect(stat->rmean, VY_STAT_UPSERT_APPLIED, 1);
 
 	if (old_stmt == NULL || vy_stmt_type(old_stmt) == IPROTO_DELETE) {
 		/*
@@ -5687,9 +5697,12 @@ vy_tx_set(struct vy_tx *tx, struct vy_index *index, struct tuple *stmt)
 			(void) old_type;
 
 			stmt = vy_apply_upsert(stmt, old->stmt, index->key_def,
-					       index->space->format, true);
+					       index->space->format, true,
+					       index->env->stat);
 			if (stmt == NULL)
 				return -1;
+			rmean_collect(index->env->stat->rmean,
+				      VY_STAT_UPSERT_REPLACED, 1);
 			assert(vy_stmt_type(stmt) != 0);
 		}
 		tuple_unref(old->stmt);
@@ -8902,7 +8915,8 @@ vy_merge_iterator_squash_upsert(struct vy_merge_iterator *itr,
 		if (next == NULL)
 			break;
 		struct tuple *applied;
-		applied = vy_apply_upsert(t, next, def, format, suppress_error);
+		applied = vy_apply_upsert(t, next, def, format, suppress_error,
+					  itr->index->env->stat);
 		tuple_unref(t);
 		if (applied == NULL)
 			return -1;
@@ -9214,7 +9228,8 @@ vy_write_iterator_next(struct vy_write_iterator *wi, struct tuple **ret)
 			/* Turn UPSERT to REPLACE. */
 			struct tuple *applied;
 			applied = vy_apply_upsert(stmt, NULL, def,
-						  wi->surrogate_format, false);
+						  wi->surrogate_format, false,
+						  wi->index->env->stat);
 			tuple_unref(stmt);
 			if (applied == NULL)
 				return -1;
@@ -9555,7 +9570,8 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 			if (vy_stmt_type(t) == IPROTO_UPSERT) {
 				struct tuple *applied;
 				applied = vy_apply_upsert(t, NULL, def,
-							  mi->format, true);
+							  mi->format, true,
+							  itr->index->env->stat);
 				tuple_unref(t);
 				t = applied;
 				assert(vy_stmt_type(t) == IPROTO_REPLACE);
@@ -9739,10 +9755,11 @@ vy_squash_process(struct vy_squash *squash)
 		if (vy_tuple_compare(result, mem_stmt, key_def) != 0)
 			break;
 		struct tuple *applied;
-		if (vy_stmt_type(mem_stmt) == IPROTO_UPSERT)
+		if (vy_stmt_type(mem_stmt) == IPROTO_UPSERT) {
 			applied = vy_apply_upsert(mem_stmt, result, key_def,
-						  format, true);
-		else
+						  format, true, env->stat);
+			rmean_collect(env->stat->rmean, VY_STAT_UPSERT_SQUASHED, 1);
+		} else
 			applied = vy_stmt_dup(mem_stmt, format);
 		tuple_unref(result);
 		if (applied == NULL)
