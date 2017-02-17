@@ -16,6 +16,8 @@ cfg_filter(box.cfg)
 ---
 - - - background
     - false
+  - - bytes_per_wal
+    - 274877906944
   - - coredump
     - false
   - - hot_standby
@@ -90,6 +92,8 @@ cfg_filter(box.cfg)
 ---
 - - - background
     - false
+  - - bytes_per_wal
+    - 274877906944
   - - coredump
     - false
   - - hot_standby

@@ -67,6 +67,8 @@ struct wal_writer
 	/* ----------------- wal ------------------- */
 	/** A setting from server configuration - rows_per_wal */
 	int64_t rows_per_wal;
+	/** A setting from server configuration - bytes_per_wal */
+	int64_t bytes_per_wal;
 	/** Another one - wal_mode */
 	enum wal_mode wal_mode;
 	/** wal_dir, from the configuration file. */
@@ -217,10 +219,12 @@ tx_schedule_rollback(struct cmsg *msg)
 static void
 wal_writer_create(struct wal_writer *writer, enum wal_mode wal_mode,
 		  const char *wal_dirname, const struct tt_uuid *server_uuid,
-		  struct vclock *vclock, int64_t rows_per_wal)
+		  struct vclock *vclock, int64_t rows_per_wal,
+		  int64_t bytes_per_wal)
 {
 	writer->wal_mode = wal_mode;
 	writer->rows_per_wal = rows_per_wal;
+	writer->bytes_per_wal = bytes_per_wal;
 
 	xdir_create(&writer->wal_dir, wal_dirname, XLOG, server_uuid);
 	writer->is_active = false;
@@ -270,7 +274,7 @@ wal_opt_rotate(struct wal_writer *writer);
 void
 wal_writer_start(enum wal_mode wal_mode, const char *wal_dirname,
 		 const struct tt_uuid *server_uuid, struct vclock *vclock,
-		 int64_t rows_per_wal)
+		 int64_t rows_per_wal, int64_t bytes_per_wal)
 {
 	assert(rows_per_wal > 1);
 
@@ -278,7 +282,7 @@ wal_writer_start(enum wal_mode wal_mode, const char *wal_dirname,
 
 	/* I. Initialize the state. */
 	wal_writer_create(writer, wal_mode, wal_dirname, server_uuid,
-			vclock, rows_per_wal);
+			vclock, rows_per_wal, bytes_per_wal);
 
 	/* II. Start the thread. */
 
@@ -388,7 +392,8 @@ wal_opt_rotate(struct wal_writer *writer)
 	 * one.
 	 */
 	if (writer->is_active &&
-	    writer->current_wal.rows >= writer->rows_per_wal) {
+	    (writer->current_wal.rows >= writer->rows_per_wal ||
+	     writer->current_wal.offset >= writer->bytes_per_wal)) {
 		/*
 		 * We can not handle xlog_close()
 		 * failure in any reasonable way.
