@@ -871,6 +871,7 @@ err_alloc_xlog:
 		say_syserror("failed to delete file '%s'", path);
 err_rotate:
 	say_debug("%s: failed", __func__);
+	say_error("vinyl can't rotate log: %s", diag_last_error(diag_get())->errmsg);
 	return -1;
 }
 

@@ -3797,6 +3797,8 @@ err_wi:
 err_mem:
 	vy_task_delete(pool, task);
 err_task:
+	say_error("%s: can't start range dump %s: %s", index->name,
+		  vy_range_str(range), diag_last_error(diag_get())->errmsg);
 	return NULL;
 }
 
@@ -4870,6 +4872,8 @@ vy_checkpoint(struct vy_env *env)
 	if (scheduler->is_throttled) {
 		assert(!diag_is_empty(&scheduler->diag));
 		diag_add_error(diag_get(), diag_last_error(&scheduler->diag));
+		say_error("Can't checkpoint, scheduler is throttled with: %s",
+			  diag_last_error(diag_get())->errmsg);
 		return -1;
 	}
 
@@ -4889,11 +4893,15 @@ vy_wait_checkpoint(struct vy_env *env, struct vclock *vclock)
 	if (scheduler->mem_min_lsn <= scheduler->checkpoint_lsn) {
 		assert(!diag_is_empty(&scheduler->diag));
 		diag_add_error(diag_get(), diag_last_error(&scheduler->diag));
+		say_error("vinyl checkpoint error: %s",
+			  diag_last_error(diag_get())->errmsg);
 		return -1;
 	}
 
 	if (vy_log_rotate(env->log, vclock_sum(vclock)) != 0)
 		return -1;
+
+	say_info("vinyl checkpoint done");
 
 	return 0;
 }
