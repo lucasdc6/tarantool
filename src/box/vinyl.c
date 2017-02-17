@@ -1578,6 +1578,60 @@ vy_range_remove_run(struct vy_range *range, struct vy_run *run)
 	range->size -= vy_run_size(run);
 }
 
+/**
+ * Allocate a new run for a range and write the information
+ * about it to the metadata log so that we could still find
+ * and delete it in case a write error occured. This function
+ * is called from dump/compaction task constructor.
+ */
+static int
+vy_range_prepare_new_run(struct vy_range *range)
+{
+	struct vy_index *index = range->index;
+	struct vy_log *log = index->env->log;
+	struct vy_run *run = vy_run_new(vy_log_next_run_id(log));
+	if (run == NULL)
+		return -1;
+	vy_log_tx_begin(log);
+	vy_log_prepare_run(log, index->key_def->opts.lsn, run->id);
+	if (vy_log_tx_commit(log) < 0) {
+		vy_run_delete(run);
+		return -1;
+	}
+	range->new_run = run;
+	return 0;
+}
+
+/**
+ * Free range->new_run and write a record to the metadata
+ * log indicating that the run is not needed any more.
+ * This function is called on dump/compaction task abort.
+ */
+static void
+vy_range_discard_new_run(struct vy_range *range)
+{
+	struct vy_index *index = range->index;
+	struct vy_run *run = range->new_run;
+	struct vy_log *log = index->env->log;
+
+	vy_log_tx_begin(log);
+	vy_log_delete_run(log, range->new_run->id);
+	if (vy_log_tx_commit(log) < 0) {
+		/*
+		 * Failure to log deletion of an incomplete
+		 * run means that we won't retry to delete
+		 * its files on log rotation. We will do that
+		 * after restart though, so just warn and
+		 * carry on.
+		 */
+		struct error *e = diag_last_error(diag_get());
+		say_warn("failed to log run %lld deletion: %s",
+			 (long long)run->id, e->errmsg);
+	}
+	vy_run_delete(run);
+	range->new_run = NULL;
+}
+
 /** Return true if a task was scheduled for a given range. */
 static bool
 vy_range_is_scheduled(struct vy_range *range)
@@ -3674,19 +3728,19 @@ vy_task_dump_complete(struct vy_task *task)
 {
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
-	struct vy_run *run = range->new_run;
 	struct vy_log *log = index->env->log;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 
 	/*
 	 * Log change in metadata.
 	 */
-	if (!vy_run_is_empty(run)) {
+	if (!vy_run_is_empty(range->new_run)) {
 		vy_log_tx_begin(log);
-		vy_log_insert_run(log, range->id, run->id);
+		vy_log_insert_run(log, range->id, range->new_run->id);
 		if (vy_log_tx_commit(log) < 0)
 			return -1;
-	}
+	} else
+		vy_range_discard_new_run(range);
 
 	say_info("%s: completed dumping range %s",
 		 index->name, vy_range_str(range));
@@ -3695,14 +3749,13 @@ vy_task_dump_complete(struct vy_task *task)
 	vy_write_iterator_delete(task->wi);
 
 	vy_index_unacct_range(index, range);
-	if (range->max_dump_size < vy_run_size(run))
-		range->max_dump_size = vy_run_size(run);
-	if (!vy_run_is_empty(run)) {
-		vy_range_add_run(range, run);
+	if (range->new_run != NULL) {
+		range->max_dump_size = MAX(range->max_dump_size,
+					   vy_run_size(range->new_run));
+		vy_range_add_run(range, range->new_run);
 		vy_range_update_compact_priority(range);
-	} else
-		vy_run_delete(run);
-	range->new_run = NULL;
+		range->new_run = NULL;
+	}
 	/*
 	 * Release dumped in-memory indexes.
 	 */
@@ -3726,8 +3779,6 @@ vy_task_dump_complete(struct vy_task *task)
 static void
 vy_task_dump_abort(struct vy_task *task, bool in_shutdown)
 {
-	(void)in_shutdown;
-
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
 
@@ -3737,9 +3788,8 @@ vy_task_dump_abort(struct vy_task *task, bool in_shutdown)
 	/* The iterator has been cleaned up in a worker thread. */
 	vy_write_iterator_delete(task->wi);
 
-	/* Delete the run we failed to write. */
-	vy_run_delete(range->new_run);
-	range->new_run = NULL;
+	if (!in_shutdown)
+		vy_range_discard_new_run(range);
 
 	/*
 	 * No need to roll back anything if we failed to write a run.
@@ -3758,7 +3808,6 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	};
 
 	struct vy_index *index = range->index;
-	struct vy_log *log = index->env->log;
 	struct tx_manager *xm = index->env->xm;
 	struct lsregion *allocator = &index->env->allocator;
 	struct vy_scheduler *scheduler = index->env->scheduler;
@@ -3768,6 +3817,9 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	struct vy_task *task = vy_task_new(pool, index, &dump_ops);
 	if (task == NULL)
 		goto err_task;
+
+	if (vy_range_prepare_new_run(range) != 0)
+		goto err_run;
 
 	if (vy_range_rotate_mem(range, index->key_def,
 				allocator, &xm->lsn) != 0)
@@ -3779,10 +3831,6 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	if (wi == NULL)
 		goto err_wi;
 
-	range->new_run = vy_run_new(vy_log_next_run_id(log));
-	if (range->new_run == NULL)
-		goto err_run;
-
 	task->range = range;
 	task->wi = wi;
 
@@ -3791,12 +3839,11 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	say_info("%s: started dumping range %s",
 		 index->name, vy_range_str(range));
 	return task;
-err_run:
-	vy_write_iterator_cleanup(wi);
-	vy_write_iterator_delete(wi);
 err_wi:
 	/* Leave the new mem on the list in case of failure. */
 err_mem:
+	vy_range_discard_new_run(range);
+err_run:
 	vy_task_delete(pool, task);
 err_task:
 	return NULL;
@@ -3862,6 +3909,11 @@ vy_task_split_complete(struct vy_task *task)
 	if (vy_log_tx_commit(log) < 0)
 		return -1;
 
+	rlist_foreach_entry(r, &range->split_list, split_list) {
+		if (vy_run_is_empty(r->new_run))
+			vy_range_discard_new_run(r);
+	}
+
 	say_info("%s: completed splitting range %s",
 		 index->name, vy_range_str(range));
 
@@ -3880,11 +3932,10 @@ vy_task_split_complete(struct vy_task *task)
 		 * Add the new run created by split to the list
 		 * unless it's empty.
 		 */
-		if (!vy_run_is_empty(r->new_run))
+		if (r->new_run != NULL) {
 			vy_range_add_run(r, r->new_run);
-		else
-			vy_run_delete(r->new_run);
-		r->new_run = NULL;
+			r->new_run = NULL;
+		}
 
 		rlist_del(&r->split_list);
 		assert(r->shadow == range);
@@ -3907,8 +3958,6 @@ vy_task_split_complete(struct vy_task *task)
 static void
 vy_task_split_abort(struct vy_task *task, bool in_shutdown)
 {
-	(void)in_shutdown;
-
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
 	struct vy_range *r, *tmp;
@@ -3918,6 +3967,11 @@ vy_task_split_abort(struct vy_task *task, bool in_shutdown)
 
 	/* The iterator has been cleaned up in a worker thread. */
 	vy_write_iterator_delete(task->wi);
+
+	if (!in_shutdown) {
+		rlist_foreach_entry(r, &range->split_list, split_list)
+			vy_range_discard_new_run(r);
+	}
 
 	/*
 	 * On split failure we delete new ranges, but leave their
@@ -3956,7 +4010,6 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 {
 	struct vy_index *index = range->index;
 	struct tx_manager *xm = index->env->xm;
-	struct vy_log *log = index->env->log;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 
 	assert(rlist_empty(&range->split_list));
@@ -3975,14 +4028,6 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 	if (task == NULL)
 		goto err_task;
 
-	vy_range_freeze_mem(range);
-
-	struct vy_write_iterator *wi;
-	wi = vy_range_get_write_iterator(range, range->run_count,
-					 tx_manager_vlsn(xm), &task->mem_count);
-	if (wi == NULL)
-		goto err_wi;
-
 	/* Determine new ranges' boundaries. */
 	keys[0] = range->begin;
 	keys[1] = split_key;
@@ -3995,10 +4040,17 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 		r = parts[i] = vy_range_new(index, -1, keys[i], keys[i + 1]);
 		if (r == NULL)
 			goto err_parts;
-		r->new_run = vy_run_new(vy_log_next_run_id(log));
-		if (r->new_run == NULL)
+		if (vy_range_prepare_new_run(r) != 0)
 			goto err_parts;
 	}
+
+	vy_range_freeze_mem(range);
+
+	struct vy_write_iterator *wi;
+	wi = vy_range_get_write_iterator(range, range->run_count,
+					 tx_manager_vlsn(xm), &task->mem_count);
+	if (wi == NULL)
+		goto err_wi;
 
 	/* Replace the old range with the new ones. */
 	vy_index_remove_range(index, range);
@@ -4028,15 +4080,17 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 	say_info("%s: started splitting range %s by key %s",
 		 index->name, vy_range_str(range), vy_key_str(split_key));
 	return task;
-err_parts:
-	for (int i = 0; i < n_parts; i++) {
-		if (parts[i] != NULL)
-			vy_range_delete(parts[i]);
-	}
-	vy_write_iterator_cleanup(wi);
-	vy_write_iterator_delete(wi);
 err_wi:
 	vy_range_unfreeze_mem(range);
+err_parts:
+	for (int i = 0; i < n_parts; i++) {
+		struct vy_range *r = parts[i];
+		if (r == NULL)
+			continue;
+		if (r->new_run != NULL)
+			vy_range_discard_new_run(r);
+		vy_range_delete(r);
+	}
 	vy_task_delete(pool, task);
 err_task:
 	return NULL;
@@ -4093,6 +4147,9 @@ vy_task_compact_complete(struct vy_task *task)
 	if (vy_log_tx_commit(log) < 0)
 		return -1;
 
+	if (vy_run_is_empty(range->new_run))
+		vy_range_discard_new_run(range);
+
 	say_info("%s: completed compacting range %s",
 		 index->name, vy_range_str(range));
 
@@ -4121,11 +4178,10 @@ vy_task_compact_complete(struct vy_task *task)
 	}
 	range->used = range->mem->used;
 	range->min_lsn = range->mem->min_lsn;
-	if (!vy_run_is_empty(range->new_run))
+	if (range->new_run != NULL) {
 		vy_range_add_run(range, range->new_run);
-	else
-		vy_run_delete(range->new_run);
-	range->new_run = NULL;
+		range->new_run = NULL;
+	}
 	range->max_dump_size = 0;
 	range->compact_priority = 0;
 	range->n_compactions++;
@@ -4138,8 +4194,6 @@ vy_task_compact_complete(struct vy_task *task)
 static void
 vy_task_compact_abort(struct vy_task *task, bool in_shutdown)
 {
-	(void)in_shutdown;
-
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
 
@@ -4149,9 +4203,8 @@ vy_task_compact_abort(struct vy_task *task, bool in_shutdown)
 	/* The iterator has been cleaned up in worker. */
 	vy_write_iterator_delete(task->wi);
 
-	/* Delete the run we failed to write. */
-	vy_run_delete(range->new_run);
-	range->new_run = NULL;
+	if (!in_shutdown)
+		vy_range_discard_new_run(range);
 
 	/*
 	 * No need to roll back anything if we failed to write a run.
@@ -4177,7 +4230,6 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 	};
 
 	struct vy_index *index = range->index;
-	struct vy_log *log = index->env->log;
 	struct tx_manager *xm = index->env->xm;
 	struct lsregion *allocator = &index->env->allocator;
 	struct vy_scheduler *scheduler = index->env->scheduler;
@@ -4187,6 +4239,9 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 	struct vy_task *task = vy_task_new(pool, index, &compact_ops);
 	if (task == NULL)
 		goto err_task;
+
+	if (vy_range_prepare_new_run(range) != 0)
+		goto err_run;
 
 	if (vy_range_rotate_mem(range, index->key_def,
 				allocator, &xm->lsn) != 0)
@@ -4198,10 +4253,6 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 	if (wi == NULL)
 		goto err_wi;
 
-	range->new_run = vy_run_new(vy_log_next_run_id(log));
-	if (range->new_run == NULL)
-		goto err_run;
-
 	task->range = range;
 	task->wi = wi;
 
@@ -4211,12 +4262,11 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		 index->name, vy_range_str(range),
                  range->compact_priority, range->run_count);
 	return task;
-err_run:
-	vy_write_iterator_cleanup(wi);
-	vy_write_iterator_delete(wi);
 err_wi:
 	/* Leave the new mem on the list in case of failure. */
 err_mem:
+	vy_range_discard_new_run(range);
+err_run:
 	vy_task_delete(pool, task);
 err_task:
 	return NULL;
