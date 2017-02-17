@@ -49,6 +49,12 @@ struct VinylSpace: public Handler {
 	virtual void
 	executeUpsert(struct txn*, struct space *space,
 	              struct request *request) override;
+	virtual void
+	executeSelect(struct txn *txn, struct space *,
+		      uint32_t index_id, uint32_t iterator,
+		      uint32_t offset, uint32_t limit,
+		      const char *key, const char *key_end,
+		      struct port *);
 	virtual void dropIndex(Index*) override;
 	virtual Index *createIndex(struct space *, struct key_def *) override;
 	virtual void prepareAlterSpace(struct space *old_space,

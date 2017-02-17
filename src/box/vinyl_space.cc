@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <scoped_guard.h>
 
 VinylSpace::VinylSpace(Engine *e)
 	:Handler(e)
@@ -127,6 +128,35 @@ VinylSpace::executeUpsert(struct txn *txn, struct space *space,
 	struct txn_stmt *stmt = txn_current_stmt(txn);
 	if (vy_upsert(tx, stmt, space, request) != 0)
 		diag_raise();
+}
+
+void
+VinylSpace::executeSelect(struct txn *txn, struct space *space,
+		       uint32_t index_id, uint32_t iterator,
+		       uint32_t offset, uint32_t limit,
+		       const char *key, const char *key_end,
+		       struct port *port)
+{
+	/**
+	 * Vinyl does not fill it's cache without txn.
+	 */
+	bool txn_started = false;
+	if (txn == NULL) {
+		/* tx was not started */
+		txn_started = true;
+		txn = txn_begin(false);
+		txn_begin_in_engine(engine, txn);
+	}
+	auto txn_guard =
+		make_scoped_guard([&]() { if (txn_started) txn_rollback(); });
+
+	Handler::executeSelect(txn, space, index_id, iterator, offset, limit,
+			       key, key_end, port);
+
+	if (txn_started) {
+		txn_started = false;
+		txn_commit(txn);
+	}
 }
 
 Index *

@@ -81,10 +81,20 @@ VinylIndex::findByKey(const char *key, uint32_t part_count) const
 	 * engine_tx might be empty, even if we are in txn context.
 	 * This can happen on a first-read statement.
 	 */
-	struct vy_tx *transaction = in_txn() ?
+	struct vy_tx *tx = in_txn() ?
 		(struct vy_tx *) in_txn()->engine_tx : NULL;
+	/**
+	 * Vinyl does not fill it's cache without txn.
+	 */
+	bool tx_started = false;
+	if (tx == NULL) {
+		tx = vy_begin(env);
+		tx_started = true;
+	}
+	auto txn_guard =
+		make_scoped_guard([&]() { if (tx_started) vy_rollback(env, tx); });
 	struct tuple *tuple = NULL;
-	if (vy_get(transaction, db, key, part_count, &tuple) != 0)
+	if (vy_get(tx, db, key, part_count, &tuple) != 0)
 		diag_raise();
 	if (tuple != NULL) {
 		tuple = tuple_bless_xc(tuple);
