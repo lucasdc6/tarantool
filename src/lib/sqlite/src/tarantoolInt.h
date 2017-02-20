@@ -43,3 +43,18 @@ int tarantoolSqlite3Delete(BtCursor *pCur, u8 flags);
  */
 int tarantoolSqlite3IdxKeyCompare(BtCursor *pCur, UnpackedRecord *pUnpacked,
                                   int *res);
+
+
+/*
+ * Format "parts" array for _index entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ */
+int tarantoolSqlite3MakeIdxParts(Index *index, void *buf);
+
+/*
+ * Format "opts" dictionary for _index entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ */
+int tarantoolSqlite3MakeIdxOpts(Index *index, const char *zSql, void *buf);

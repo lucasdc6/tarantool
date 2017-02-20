@@ -583,3 +583,141 @@ static uint32_t get_space_id(Pgno page, uint32_t *index_id)
 	if (index_id) *index_id = SQLITE_PAGENO_TO_INDEXID(page);
 	return SQLITE_PAGENO_TO_SPACEID(page);
 }
+
+/*********************************************************************
+ * Metainformation about available spaces and indices is stored in
+ * _space and _index system spaces respectively.
+ *
+ * SQLite inserts entries in system spaces.
+ *
+ * The routines below are called during SQL query processing in order to
+ * format data for certain fields in _space and _index.
+ */
+
+/*
+ * Resulting data is of the variable length. Routines are called twice:
+ *  1. with a NULL buffer, yielding result size estimation;
+ *  2. with a buffer of the estimated size, rendering the result.
+ *
+ * For convenience, formatting routines use Enc structure to call
+ * Enc is either configured to perform size estimation
+ * or to render the result.
+ */
+struct Enc
+{
+	char *(*encode_uint)  (char *data, uint64_t num);
+	char *(*encode_str)   (char *data, const char *str, uint32_t len);
+	char *(*encode_bool)  (char *data, bool v);
+	char *(*encode_array) (char *data, uint32_t len);
+	char *(*encode_map)   (char *data, uint32_t len);
+};
+
+/* no_encode_XXX functions estimate result size */
+
+static char *no_encode_uint(char *data, uint64_t num)
+{
+	/* MsgPack UINT is encoded in 9 bytes or less */
+	(void)num; return data + 9;
+}
+
+static char *no_encode_str(char *data, const char *str, uint32_t len)
+{
+	/* MsgPack STR header is encoded in 5 bytes or less, followed by
+	 * the string data. */
+	(void)str; return data + 5 + len;
+}
+
+static char *no_encode_bool(char *data, bool v)
+{
+	/* MsgPack BOOL is encoded in 1 byte. */
+	(void)v; return data + 1;
+}
+
+static char *no_encode_array_or_map(char *data, uint32_t len)
+{
+	/* MsgPack ARRAY or MAP header is encoded in 5 bytes or less. */
+	(void)len; return data + 5;
+}
+
+/*
+ * If buf==NULL, return Enc that will perform size estimation;
+ * otherwize, return Enc that renders results in the provided buf.
+ */
+static const struct Enc *get_enc(void *buf)
+{
+	static const struct Enc mp_enc = {
+		mp_encode_uint, mp_encode_str, mp_encode_bool,
+		mp_encode_array, mp_encode_map
+	}, no_enc = {
+		no_encode_uint, no_encode_str, no_encode_bool,
+		no_encode_array_or_map, no_encode_array_or_map
+	};
+	return buf ? &mp_enc : &no_enc;
+}
+
+/*
+ * Convert SQLite affinity value to the corresponding Tarantool type
+ * string which is suitable for _index.parts field.
+ */
+static const char *convertSqliteAffinity(int affinity)
+{
+	switch (affinity) {
+	default:
+		assert(false);
+	case SQLITE_AFF_BLOB:
+		return "scalar";
+	case SQLITE_AFF_TEXT:
+		return "string";
+	case SQLITE_AFF_NUMERIC:
+	case SQLITE_AFF_REAL:
+		return "number";
+	case SQLITE_AFF_INTEGER:
+		return "integer";
+	}
+}
+
+/*
+ * Format "parts" array for _index entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ *
+ * Ex: [[0, "integer"]]
+ */
+int tarantoolSqlite3MakeIdxParts(SqliteIndex *pIndex, void *buf)
+{
+	struct Column *aCol = pIndex->pTable->aCol;
+	const struct Enc *enc = get_enc(buf);
+	char *base = buf, *p;
+	int i, n = pIndex->nKeyCol;
+	p = enc->encode_array(base, n);
+	for (i=0; i<n; i++) {
+		int col = pIndex->aiColumn[i];
+		const char *t = convertSqliteAffinity(aCol[col].affinity);
+		p = enc->encode_array(p, 2),
+		p = enc->encode_uint(p, col);
+		p = enc->encode_str(p, t, strlen(t));
+	}
+	return (int)(p - base);
+}
+
+/*
+ * Format "opts" dictionary for _index entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ *
+ * Ex: {
+ *   "unique": "true",
+ *   "sql": "CREATE INDEX student_by_name ON students(name)"
+ * }
+ */
+int tarantoolSqlite3MakeIdxOpts(SqliteIndex *index, const char *zSql, void *buf)
+{
+	const struct Enc *enc = get_enc(buf);
+	char *base = buf, *p;
+	p = enc->encode_map(base, 2);
+	p = enc->encode_str(p, "unique", 6);
+	p = enc->encode_bool(p, index->onError != OE_None);
+	p = enc->encode_str(p, "sql", 3);
+	p = enc->encode_str(p, zSql, zSql ? strlen(zSql) : 0);
+	return (int)(p - base);
+}

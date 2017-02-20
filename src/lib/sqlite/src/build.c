@@ -23,6 +23,8 @@
 **     ROLLBACK
 */
 #include "sqliteInt.h"
+#include "vdbeInt.h"
+#include "tarantoolInt.h"
 
 #ifndef SQLITE_OMIT_SHARED_CACHE
 /*
@@ -970,11 +972,6 @@ void sqlite3StartTable(
   ** now.
   */
   if( !db->init.busy && (v = sqlite3GetVdbe(pParse))!=0 ){
-    int addr1;
-    int fileFormat;
-    int reg1, reg2, reg3;
-    /* nullRow[] is an OP_Record encoding of a row containing 5 NULLs */
-    static const char nullRow[] = { 6, 0, 0, 0, 0, 0 };
     sqlite3BeginWriteOperation(pParse, 1, iDb);
 
 #ifndef SQLITE_OMIT_VIRTUALTABLE
@@ -982,45 +979,6 @@ void sqlite3StartTable(
       sqlite3VdbeAddOp0(v, OP_VBegin);
     }
 #endif
-
-    /* If the file format and encoding in the database have not been set, 
-    ** set them now.
-    */
-    reg1 = pParse->regRowid = ++pParse->nMem;
-    reg2 = pParse->regRoot = ++pParse->nMem;
-    reg3 = ++pParse->nMem;
-    sqlite3VdbeAddOp3(v, OP_ReadCookie, iDb, reg3, BTREE_FILE_FORMAT);
-    sqlite3VdbeUsesBtree(v, iDb);
-    addr1 = sqlite3VdbeAddOp1(v, OP_If, reg3); VdbeCoverage(v);
-    fileFormat = (db->flags & SQLITE_LegacyFileFmt)!=0 ?
-                  1 : SQLITE_MAX_FILE_FORMAT;
-    sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_FILE_FORMAT, fileFormat);
-    sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_TEXT_ENCODING, ENC(db));
-    sqlite3VdbeJumpHere(v, addr1);
-
-    /* This just creates a place-holder record in the sqlite_master table.
-    ** The record created does not contain anything yet.  It will be replaced
-    ** by the real entry in code generated at sqlite3EndTable().
-    **
-    ** The rowid for the new entry is left in register pParse->regRowid.
-    ** The root page number of the new table is left in reg pParse->regRoot.
-    ** The rowid and root page number values are needed by the code that
-    ** sqlite3EndTable will generate.
-    */
-#if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE)
-    if( isView || isVirtual ){
-      sqlite3VdbeAddOp2(v, OP_Integer, 0, reg2);
-    }else
-#endif
-    {
-      pParse->addrCrTab = sqlite3VdbeAddOp2(v, OP_CreateTable, iDb, reg2);
-    }
-    sqlite3OpenMasterTable(pParse, iDb);
-    sqlite3VdbeAddOp2(v, OP_NewRowid, 0, reg1);
-    sqlite3VdbeAddOp4(v, OP_Blob, 6, reg3, 0, nullRow, P4_STATIC);
-    sqlite3VdbeAddOp3(v, OP_Insert, 0, reg3, reg1);
-    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
-    sqlite3VdbeAddOp0(v, OP_Close);
   }
 
   /* Normal (non-error) return. */
@@ -1672,12 +1630,6 @@ static int hasColumn(const i16 *aiCol, int nCol, int x){
 ** Changes include:
 **
 **     (1)  Set all columns of the PRIMARY KEY schema object to be NOT NULL.
-**     (2)  Convert the OP_CreateTable into an OP_CreateIndex.  There is
-**          no rowid btree for a WITHOUT ROWID.  Instead, the canonical
-**          data storage is a covering index btree.
-**     (3)  Bypass the creation of the sqlite_master table entry
-**          for the PRIMARY KEY as the primary key index is now
-**          identified by the sqlite_master table entry of the table itself.
 **     (4)  Set the Index.tnum of the PRIMARY KEY Index object in the
 **          schema to the rootpage from the main table.
 **     (5)  Add all table columns to the PRIMARY KEY Index object
@@ -1695,7 +1647,6 @@ static void convertToWithoutRowidTable(Parse *pParse, Table *pTab){
   int nPk;
   int i, j;
   sqlite3 *db = pParse->db;
-  Vdbe *v = pParse->pVdbe;
 
   /* Mark every PRIMARY KEY column as NOT NULL (except for imposter tables)
   */
@@ -1710,15 +1661,6 @@ static void convertToWithoutRowidTable(Parse *pParse, Table *pTab){
   /* The remaining transformations only apply to b-tree tables, not to
   ** virtual tables */
   if( IN_DECLARE_VTAB ) return;
-
-  /* Convert the OP_CreateTable opcode that would normally create the
-  ** root-page for the table into an OP_CreateIndex opcode.  The index
-  ** created will become the PRIMARY KEY index.
-  */
-  if( pParse->addrCrTab ){
-    assert( v );
-    sqlite3VdbeChangeOpcode(v, pParse->addrCrTab, OP_CreateIndex);
-  }
 
   /* Locate the PRIMARY KEY index.  Or, if this table was originally
   ** an INTEGER PRIMARY KEY table, create a new PRIMARY KEY index. 
@@ -1739,15 +1681,6 @@ static void convertToWithoutRowidTable(Parse *pParse, Table *pTab){
     pTab->iPKey = -1;
   }else{
     pPk = sqlite3PrimaryKeyIndex(pTab);
-
-    /* Bypass the creation of the PRIMARY KEY btree and the sqlite_master
-    ** table entry. This is only required if currently generating VDBE
-    ** code for a CREATE TABLE (not when parsing one as part of reading
-    ** a database schema).  */
-    if( v ){
-      assert( db->init.busy==0 );
-      sqlite3VdbeChangeOpcode(v, pPk->tnum, OP_Goto);
-    }
 
     /*
     ** Remove all redundant columns from the PRIMARY KEY.  For example, change
@@ -1814,6 +1747,111 @@ static void convertToWithoutRowidTable(Parse *pParse, Table *pTab){
   }else{
     pPk->nColumn = pTab->nCol;
   }
+}
+
+/*
+** Generate VDBE code to create an Index. This is acomplished by adding
+** an entry to the _index table. ISpaceId either contains the literal
+** space id or designates a register storing the id.
+*/
+static void createIndex(
+  Parse *pParse,
+  Index *pIndex,
+  int iSpaceId,
+  int iIndexId,
+  const char *zSql,
+  Table *pSysIndex,
+  int iCursor
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  int iFirstCol = ++pParse->nMem;
+  int iRecord = (pParse->nMem += 6); /* 6 total columns */
+  char *zOpts, *zParts;
+  int zOptsSz, zPartsSz;
+
+  /* Format "opts" and "parts" for _index entry. */
+  zOpts = sqlite3DbMallocRaw(pParse->db,
+    tarantoolSqlite3MakeIdxOpts(pIndex, zSql, NULL) +
+    tarantoolSqlite3MakeIdxParts(pIndex, NULL) + 2
+  );
+  if (!zOpts) return;
+  zOptsSz = tarantoolSqlite3MakeIdxOpts(pIndex, zSql, zOpts);
+  zParts = zOpts + zOptsSz + 1;
+  zPartsSz = tarantoolSqlite3MakeIdxParts(pIndex, zParts);
+#if SQLITE_DEBUG
+  /* NUL-termination is necessary for VDBE trace facility only */
+  zOpts[zOptsSz] = 0;
+  zParts[zPartsSz] = 0;
+#endif
+
+  if( pParse->pNewTable ){
+    /*
+     * A new table is being created, hence iSpaceId is a register, but
+     * iIndexId is literal.
+     */
+    sqlite3VdbeAddOp2(v, OP_SCopy, iSpaceId, iFirstCol);
+    sqlite3VdbeAddOp2(v, OP_Integer, iIndexId, iFirstCol+1);
+  }else{
+    /*
+     * An existing table is being modified; iSpaceId is literal, but
+     * iIndexId is a register.
+     */
+    sqlite3VdbeAddOp2(v, OP_Integer, iSpaceId, iFirstCol);
+    sqlite3VdbeAddOp2(v, OP_SCopy, iIndexId, iFirstCol+1);
+  }
+  sqlite3VdbeAddOp4(v,
+    OP_String8, 0, iFirstCol+2, 0,
+    sqlite3DbStrDup(pParse->db, pIndex->zName),
+    P4_DYNAMIC
+  );
+  sqlite3VdbeAddOp4(v, OP_String8, 0, iFirstCol+3, 0, "tree", P4_STATIC);
+  sqlite3VdbeAddOp4(v, OP_Blob, zOptsSz, iFirstCol+4, MSGPACK_SUBTYPE, zOpts, P4_DYNAMIC);
+  /* zOpts and zParts are co-located, hence STATIC */
+  sqlite3VdbeAddOp4(v, OP_Blob, zPartsSz, iFirstCol+5, MSGPACK_SUBTYPE, zParts, P4_STATIC);
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, iFirstCol, 6, iRecord);
+  sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iCursor, iRecord, iFirstCol, 6);
+  sqlite3TableAffinity(v, pSysIndex, 0);
+}
+
+/*
+ * Generate code to initialize register range with arguments for
+ * ParseSchema2. Consumes zSql. Returns the first register used.
+ */
+static int makeIndexSchemaRecord(
+  Parse *pParse,
+  Index *pIndex,
+  int iSpaceId,
+  int iIndexId,
+  const char *zSql
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  int iFirstCol = pParse->nMem + 1;
+  pParse->nMem += 4;
+
+  sqlite3VdbeAddOp4(v,
+    OP_String8, 0, iFirstCol, 0,
+    sqlite3DbStrDup(pParse->db, pIndex->zName),
+    P4_DYNAMIC
+  );
+
+  if( pParse->pNewTable ){
+    /*
+     * A new table is being created, hence iSpaceId is a register, but
+     * iIndexId is literal.
+     */
+    sqlite3VdbeAddOp2(v, OP_SCopy, iSpaceId, iFirstCol+1);
+    sqlite3VdbeAddOp2(v, OP_Integer, iIndexId, iFirstCol+2);
+  }else{
+    /*
+     * An existing table is being modified; iSpaceId is literal, but
+     * iIndexId is a register.
+     */
+    sqlite3VdbeAddOp2(v, OP_Integer, iSpaceId, iFirstCol+1);
+    sqlite3VdbeAddOp2(v, OP_SCopy, iIndexId, iFirstCol+2);
+  }
+
+  sqlite3VdbeAddOp4(v, OP_String8, 0, iFirstCol+3, 0, zSql, P4_DYNAMIC);
+  return iFirstCol;
 }
 
 /*
@@ -1918,8 +1956,6 @@ void sqlite3EndTable(
     v = sqlite3GetVdbe(pParse);
     if( NEVER(v==0) ) return;
 
-    sqlite3VdbeAddOp1(v, OP_Close, 0);
-
     /* 
     ** Initialize zType for the new view or table.
     */
@@ -2003,22 +2039,6 @@ void sqlite3EndTable(
       );
     }
 
-    /* A slot for the record has already been allocated in the 
-    ** SQLITE_MASTER table.  We just need to update that slot with all
-    ** the information we've collected.
-    */
-    sqlite3NestedParse(pParse,
-      "UPDATE %Q.%s "
-         "SET type='%s', name=%Q, tbl_name=%Q, rootpage=#%d, sql=%Q "
-       "WHERE rowid=#%d",
-      db->aDb[iDb].zDbSName, MASTER_NAME,
-      zType,
-      p->zName,
-      p->zName,
-      pParse->regRoot,
-      zStmt,
-      pParse->regRowid
-    );
     sqlite3DbFree(db, zStmt);
     sqlite3ChangeCookie(pParse, iDb);
 
@@ -2039,8 +2059,6 @@ void sqlite3EndTable(
 #endif
 
     /* Reparse everything to update our internal data structures */
-    sqlite3VdbeAddParseSchemaOp(v, iDb,
-           sqlite3MPrintf(db, "tbl_name='%q' AND type!='trigger'", p->zName));
   }
 
 
@@ -2885,6 +2903,50 @@ Index *sqlite3AllocateIndexObject(
 }
 
 /*
+** Generate code to determine next free Iid in the space identified by
+** the iSpaceId. Return register number holding the result.
+*/
+static int getNewIid(
+  Parse *pParse,
+  int iSpaceId,
+  int iCursor
+){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  int iRes = ++pParse->nMem;
+  int iKey = ++pParse->nMem;
+  int iSeekInst, iGotoInst;
+
+  sqlite3VdbeAddOp2(v, OP_Integer, iSpaceId, iKey);
+  iSeekInst = sqlite3VdbeAddOp4Int(v, OP_SeekLE, iCursor, 0, iKey, 1);
+  sqlite3VdbeAddOp4Int(v, OP_IdxLT, iCursor, 0, iKey, 1);
+
+  /*
+   * If SeekLE succeeds, the control falls through here, skipping
+   * IdxLt.
+   *
+   * If it fails (no entry with the given key prefix: invalid spaceId)
+   * VDBE jumps to the next code block (jump target is IMM, fixed up
+   * later with sqlite3VdbeJumpHere()).
+   */
+  iGotoInst = sqlite3VdbeAddOp0(v, OP_Goto); /* Jump over Halt */
+
+  /* Invalid spaceId detected. Halt now. */
+  sqlite3VdbeJumpHere(v, iSeekInst);
+  sqlite3VdbeJumpHere(v, iSeekInst+1);
+  sqlite3VdbeAddOp4(v,
+    OP_Halt, SQLITE_ERROR, OE_Fail, 0,
+    sqlite3MPrintf(pParse->db, "Invalid space id: %d", iSpaceId),
+    P4_DYNAMIC
+  );
+
+  /* Fetch iid from the row and ++it. */
+  sqlite3VdbeJumpHere(v, iGotoInst);
+  sqlite3VdbeAddOp3(v, OP_Column, iCursor, 1, iRes);
+  sqlite3VdbeAddOp2(v, OP_AddImm, iRes, 1);
+  return iRes;
+}
+
+/*
 ** Create a new index for an SQL table.  pName1.pName2 is the name of the index 
 ** and pTblList is the name of the table that is to be indexed.  Both will 
 ** be NULL for a primary key or an index that is created to satisfy a
@@ -3345,64 +3407,53 @@ void sqlite3CreateIndex(
   ** has just been created, it contains no data and the index initialization
   ** step can be skipped.
   */
-  else if( HasRowid(pTab) || pTblName!=0 ){
+  else if( pTblName ){
     Vdbe *v;
     char *zStmt;
-    int iMem = ++pParse->nMem;
+    Table *pSysIndex;
+    int iCursor = pParse->nTab++;
+    int iSpaceId, iIndexId, iFirstSchemaCol;
 
     v = sqlite3GetVdbe(pParse);
     if( v==0 ) goto exit_create_index;
 
     sqlite3BeginWriteOperation(pParse, 1, iDb);
 
-    /* Create the rootpage for the index using CreateIndex. But before
-    ** doing so, code a Noop instruction and store its address in 
-    ** Index.tnum. This is required in case this index is actually a 
-    ** PRIMARY KEY and the table is actually a WITHOUT ROWID table. In 
-    ** that case the convertToWithoutRowidTable() routine will replace
-    ** the Noop with a Goto to jump over the VDBE code generated below. */
-    pIndex->tnum = sqlite3VdbeAddOp0(v, OP_Noop);
-    sqlite3VdbeAddOp2(v, OP_CreateIndex, iDb, iMem);
+    pSysIndex = sqlite3HashFind(
+      &pParse->db->aDb[0].pSchema->tblHash, "_index"
+    );
+    if( NEVER(!pSysIndex) ) return;
+
+    sqlite3OpenTable(pParse, iCursor, iDb, pSysIndex, OP_OpenWrite);
+    sqlite3VdbeChangeP5(v, OPFLAG_SEEKEQ);
 
     /* Gather the complete text of the CREATE INDEX statement into
     ** the zStmt variable
     */
-    if( pStart ){
+    assert( pStart ); {
       int n = (int)(pParse->sLastToken.z - pName->z) + pParse->sLastToken.n;
       if( pName->z[n-1]==';' ) n--;
       /* A named index with an explicit CREATE INDEX statement */
       zStmt = sqlite3MPrintf(db, "CREATE%s INDEX %.*s",
         onError==OE_None ? "" : " UNIQUE", n, pName->z);
-    }else{
-      /* An automatic index created by a PRIMARY KEY or UNIQUE constraint */
-      /* zStmt = sqlite3MPrintf(""); */
-      zStmt = 0;
     }
 
-    /* Add an entry in sqlite_master for this index
-    */
-    sqlite3NestedParse(pParse, 
-        "INSERT INTO %Q.%s VALUES('index',%Q,%Q,#%d,%Q);",
-        db->aDb[iDb].zDbSName, MASTER_NAME,
-        pIndex->zName,
-        pTab->zName,
-        iMem,
-        zStmt
-    );
-    sqlite3DbFree(db, zStmt);
+    iSpaceId = SQLITE_PAGENO_TO_SPACEID(pTab->tnum);
+    iIndexId = getNewIid(pParse, iSpaceId, iCursor);
+    createIndex(pParse, pIndex, iSpaceId, iIndexId, zStmt, pSysIndex, iCursor);
+    sqlite3VdbeAddOp1(v, OP_Close, iCursor);
 
-    /* Fill the index with data and reparse the schema. Code an OP_Expire
+    /* consumes zStmt */
+    iFirstSchemaCol = makeIndexSchemaRecord(
+        pParse, pIndex, iSpaceId, iIndexId, zStmt
+    );
+
+    /* Reparse the schema. Code an OP_Expire
     ** to invalidate all pre-compiled statements.
     */
-    if( pTblName ){
-      sqlite3RefillIndex(pParse, pIndex, iMem);
-      sqlite3ChangeCookie(pParse, iDb);
-      sqlite3VdbeAddParseSchemaOp(v, iDb,
-         sqlite3MPrintf(db, "name='%q' AND type='index'", pIndex->zName));
-      sqlite3VdbeAddOp0(v, OP_Expire);
-    }
-
-    sqlite3VdbeJumpHere(v, pIndex->tnum);
+    sqlite3ChangeCookie(pParse, iDb);
+    sqlite3VdbeAddParseSchema2Op(v, iDb, iFirstSchemaCol, 4);
+    sqlite3VdbeAddOp0(v, OP_Expire);
   }
 
   /* When adding an index to the list of indices for a table, make
