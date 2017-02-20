@@ -153,6 +153,13 @@ struct opt_def {
 #define OPT_DEF(key, type, opts, field) \
 	{ key, type, offsetof(opts, field), sizeof(((opts *)0)->field) }
 
+/*
+ * Option type is checked but the value is discarded.
+ * Opt_set() treats opt_def-s with negative offsets as dummy ones.
+ */
+#define DUMMY_OPT_DEF(key, type) \
+	{ key, type, -1, 1 }
+
 enum rtree_index_distance_type {
 	 /* Euclid distance, sqrt(dx*dx + dy*dy) */
 	RTREE_INDEX_DISTANCE_TYPE_EUCLID,
