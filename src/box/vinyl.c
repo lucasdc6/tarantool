@@ -4709,6 +4709,19 @@ static int
 vy_scheduler_complete_task(struct vy_scheduler *scheduler,
 			   struct vy_task *task)
 {
+	if (task->index->is_dropped) {
+		/*
+		 * Records corresponding to dropped indexes are
+		 * deleted from the metadata log on rotation, so we
+		 * must not log a run creation/deletion if the index
+		 * this run is for was dropped, otherwise we'll fail
+		 * to recover with an index/range/run not found error.
+		 * So call ->abort instead of ->complete() here.
+		 */
+		if (task->ops->abort)
+			task->ops->abort(task, false);
+		return 0;
+	}
 	if (task->status != 0) {
 		/* ->execute failed, propagate diag */
 		assert(!diag_is_empty(&task->diag));
