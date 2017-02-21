@@ -420,6 +420,7 @@ const struct space_opts space_opts_default = {
 
 const struct opt_def space_opts_reg[] = {
 	OPT_DEF("temporary", OPT_BOOL, struct space_opts, temporary),
+	DUMMY_OPT_DEF("sql", OPT_STR),
 	{ NULL, opt_type_MAX, 0, 0 }
 };
 

@@ -46,6 +46,20 @@ int tarantoolSqlite3IdxKeyCompare(BtCursor *pCur, UnpackedRecord *pUnpacked,
 
 
 /*
+ * Render "format" array for _space entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ */
+int tarantoolSqlite3MakeTableFormat(Table *pTable, void *buf);
+
+/*
+ * Format "opts" dictionary for _space entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ */
+int tarantoolSqlite3MakeTableOpts(Table *pTable, const char *zSql, void *buf);
+
+/*
  * Format "parts" array for _index entry.
  * Returns result size.
  * If buf==NULL estimate result size.

@@ -677,6 +677,51 @@ static const char *convertSqliteAffinity(int affinity)
 }
 
 /*
+ * Render "format" array for _space entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ *
+ * Ex: [{"name": "col1", "type": "integer"}, ... ]
+ */
+int tarantoolSqlite3MakeTableFormat(Table *pTable, void *buf)
+{
+	struct Column *aCol = pTable->aCol;
+	const struct Enc *enc = get_enc(buf);
+	char *base = buf, *p;
+	int i, n = pTable->nCol;
+	p = enc->encode_array(base, n);
+	for (i=0; i<n; i++) {
+		const char *t;
+		p = enc->encode_map(p, 2);
+		p = enc->encode_str(p, "name", 4);
+		p = enc->encode_str(p, aCol[i].zName, strlen(aCol[i].zName));
+		p = enc->encode_str(p, "type", 4);
+		t = aCol[i].affinity == SQLITE_AFF_BLOB ? "*" :
+			convertSqliteAffinity(aCol[i].affinity);
+		p = enc->encode_str(p, t, strlen(t));
+	}
+	return (int)(p - base);
+}
+
+/*
+ * Format "opts" dictionary for _space entry.
+ * Returns result size.
+ * If buf==NULL estimate result size.
+ *
+ * Ex: {"temporary": true, "sql": "CREATE TABLE student (name, grade)"}
+ */
+int tarantoolSqlite3MakeTableOpts(Table *pTable, const char *zSql, void *buf)
+{
+	(void)pTable;
+	const struct Enc *enc = get_enc(buf);
+	char *base = buf, *p;
+	p = enc->encode_map(base, 1);
+	p = enc->encode_str(p, "sql", 3);
+	p = enc->encode_str(p, zSql, strlen(zSql));
+	return (int)(p - base);
+}
+
+/*
  * Format "parts" array for _index entry.
  * Returns result size.
  * If buf==NULL estimate result size.
