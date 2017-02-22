@@ -6800,8 +6800,8 @@ vy_commit_stmt(struct txv *v, int64_t lsn, uint64_t *write_count)
 	assert(v != NULL);
 	assert(! v->is_read);
 	/*
-	 * The first txv always from the primary index. All
-	 * following txv's, if exist, are from the secondary
+	 * The first txv is always from a primary index. All
+	 * following txv's, if exist, are from secondary
 	 * indexes.
 	 */
 	struct tuple *mem_stmt;
@@ -6815,8 +6815,7 @@ vy_commit_stmt(struct txv *v, int64_t lsn, uint64_t *write_count)
 		return 0;
 	/*
 	 * If the space has secondary indexes then all operations
-	 * are decomposed in DELETE + REPLACE or turned in one
-	 * REPLACE:
+	 * are decomposed into DELETE, REPLACE or DELETE + REPLACE:
 	 * INSERT = REPLACE in all indexes.
 	 * UPDATE = REPLACE in primary and DELETE + REPLACE in
 	 *          secondary.
@@ -6829,11 +6828,11 @@ vy_commit_stmt(struct txv *v, int64_t lsn, uint64_t *write_count)
 	assert(stmt_type == IPROTO_DELETE || stmt_type == IPROTO_REPLACE);
 	/*
 	 * If vy_tx_write returned 0 and mem_stmt == NULL, then
-	 * maybe it was first DELETE in the index, or this
-	 * statement already is commited
+	 * maybe it was the first DELETE in the index, or this
+	 * statement is already committed.
 	 * (@sa vy_stmt_is_committed()) and nothing was written to
-	 * the vy_mem. In such case we have to copy into vy_mems
-	 * the original statement (not lsregion allocated).
+	 * the vy_mem. In such a case we have to copy the original statement
+	 * (not lsregion allocated) into vy_mems.
 	 */
 	bool is_region = true;
 	struct tuple *mem_delete = NULL, *unused;
@@ -6842,7 +6841,7 @@ vy_commit_stmt(struct txv *v, int64_t lsn, uint64_t *write_count)
 		is_region = false;
 	} else if (stmt_type == IPROTO_DELETE) {
 		/**
-		 * If there is the DELETE from the primary index
+		 * If there is a DELETE from the primary index
 		 * then we can use it also for secondary indexes
 		 * owing to the common txv memory level.
 		 */
@@ -6876,7 +6875,7 @@ vy_commit_stmt(struct txv *v, int64_t lsn, uint64_t *write_count)
 			/*
 			 * If the DELETE is met and the statement
 			 * type is not DELETE, then the following
-			 * txv always is for the same index and
+			 * txv is always for the same index and
 			 * has the REPLACE type.
 			 */
 			next_v = vy_get_next_writing_txv(next_v);
@@ -6909,10 +6908,10 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 	uint64_t write_count = 0;
 	stailq_foreach_entry(v, &tx->log, next_in_log) {
 		/*
-		 * Find begin of the next statement. Each
+		 * Find the beginning of the next statement. Each
 		 * statement has txv in the primary index at
 		 * first, so we find the txv with the primary
-		 * index id. Also we skip all read-only txvs.
+		 * index id. We also skip all read-only txvs.
 		 */
 		if (v->is_read || v->index->key_def->iid != 0) {
 			do {
@@ -6925,7 +6924,7 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 		assert(rc == 0);
 		(void) rc;
 		/*
-		 * Get the next txv, belonging to a secondary
+		 * Get the next txv that belongs to a secondary
 		 * index. If we reached end of the log, then
 		 * break the cycle.
 		 */
